@@ -222,8 +222,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         return EXIT_OK
 
     if not args.input or args.output is None:
+        configure_logging(args.log_level or "INFO", None)
         parser.print_usage(sys.stderr)
-        print("panelrecon: --input et --output sont requis", file=sys.stderr)
+        logger.error("--input et --output sont requis")
         return EXIT_USAGE
 
     try:

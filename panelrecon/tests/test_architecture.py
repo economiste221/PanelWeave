@@ -8,7 +8,11 @@ CORE_MODULES = (
     "panelrecon.core.models",
     "panelrecon.core.video_io",
     "panelrecon.core.hardware",
+    "panelrecon.core.geometry",
+    "panelrecon.core.synthetic",
+    "panelrecon.core.evaluation",
     "panelrecon.cli",
+    "panelrecon.synth_cli",
 )
 
 

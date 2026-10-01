@@ -15,7 +15,7 @@ vidéo → séquences → segmentation panel/fond → mouvement inter-frames →
 | Phase | Contenu | État |
 |---|---|---|
 | 1 | Squelette, configuration, modèles, `video_io`, détection matérielle, CLI (`inventory`) | ✅ |
-| 2 | Générateur synthétique + tests de référence | à faire |
+| 2 | Générateur synthétique avec vérité terrain, métriques d'évaluation, reconstruction oracle | ✅ |
 | 3 | Mouvement (SIFT + RANSAC + ECC), chaînage | à faire |
 | 4 | Mosaïque, fusion médiane, couverture, export | à faire |
 | 5 | Segmentation classique, découpage en séquences | à faire |
@@ -70,6 +70,51 @@ Une vidéo illisible est journalisée avec sa trace sans interrompre le lot.
 Codes de sortie : `0` succès, `1` au moins une vidéo en échec, `2` erreur d'usage/configuration,
 `130` interruption.
 
+## Vidéos synthétiques de référence (phase 2)
+
+```bash
+python -m panelrecon.synth_cli --list                                  # scénarios disponibles
+python -m panelrecon.synth_cli --output synth --all --oracle           # génère + évalue l'oracle
+python -m panelrecon.synth_cli --output synth -s zoom_in --panel-image mon_panel.png
+```
+
+Chaque scénario produit `<nom>.mp4|mkv`, `<nom>_panel<k>.png` (panel original) et
+`<nom>_ground_truth.json` : pour chaque frame, la similarité exacte `panel → écran`, l'instant de
+présentation, le plan d'appartenance (ou le mélange pour une frame de fondu) et l'indicateur de
+duplication ; la boîte du sous-titre incrusté le cas échéant.
+
+| Scénario | Cas limite couvert |
+|---|---|
+| `static` | panel entièrement visible, séquence statique |
+| `pan_horizontal`, `pan_vertical` | translation pure (panel plus large / plus étroit que l'écran) |
+| `zoom_in`, `zoom_out` | zoom (avec léger recentrage) |
+| `pan_zoom_eased` | translation + zoom, 3 poses clés, easing `ease_in_out`, fond qui suit le cadrage |
+| `duplicates` | chaque pose répétée 2 fois (animation à 12,5 i/s dans une vidéo à 25 i/s) |
+| `crossfade` | deux panels séparés par un fondu enchaîné de 6 frames |
+| `subtitles` | sous-titre fixe incrusté |
+| `flat_texture` | panel en aplats, très peu de points d'intérêt |
+| `short` | séquence de 4 frames |
+| `vfr` | fréquence d'images variable (conteneur mkv, pts à la milliseconde) |
+
+Le rendu applique une pré-réduction INTER_AREA composée exactement avec le warp résiduel
+(anti-repliement sans biais géométrique) ; l'exactitude de la vérité terrain est vérifiée de façon
+indépendante par le centroïde de taches gaussiennes (< 0,05 px, en réduction, agrandissement et
+rotation).
+
+`panelrecon/core/evaluation.py` fournit les mesures que les phases suivantes devront satisfaire
+(`ReferenceThresholds` : translation < 1 px, échelle < 0,5 %, SSIM > 0,95, couverture ≥ 98 %,
+surestimation ≤ 1 %) :
+
+* `pose_errors` : erreurs des poses `frame → canevas` estimées, après ajustement par moindres carrés
+  de la jauge `panel → canevas` (le repère du canevas est arbitraire) ; erreurs en pixels écran ;
+* `pairwise_error` : erreur d'un mouvement inter-frames ;
+* `masked_ssim`, `evaluate_mosaic` : SSIM/PSNR de la reconstruction contre le panel original
+  rééchantillonné dans le canevas, couverture réelle et couverture surestimée ;
+* `oracle_mosaic` : fusion médiane avec les poses **exactes** — borne supérieure de référence.
+
+Résultats de l'oracle sur les vidéos encodées (crf 14) : SSIM de 0,964 (`zoom_in`) à 0,996
+(`flat_texture`), couverture ≥ 0,996, surestimation 0.
+
 ## Configuration
 
 Tout paramètre passe par `PipelineConfig` (`panelrecon/core/config.py`), sérialisée en JSON strict :
@@ -89,7 +134,8 @@ compatibilité des profils).
 ## Validation
 
 ```bash
-python -m pytest            # 80 tests : config, modèles, video_io, matériel, CLI, architecture
+python -m pytest            # 127 tests (~70 s) : config, modèles, video_io, matériel, CLI,
+                            # générateur synthétique, évaluation, oracle de référence
 python -m mypy              # mode strict sur tout le paquet
 ```
 
@@ -99,21 +145,29 @@ python -m mypy              # mode strict sur tout le paquet
 panelrecon/
   __init__.py
   cli.py                # mode headless
+  synth_cli.py          # génération de vidéos synthétiques de référence
   core/                 # aucune dépendance à PyQt5 (vérifié par test_architecture.py)
     config.py           # PipelineConfig + sections, JSON strict, validation par métadonnées
     models.py           # SimilarityTransform, MotionEstimate, FrameObs, Sequence, CropBox,
                         # MosaicResult, QualityReport, VideoInfo, CancellationToken
     video_io.py         # VideoReader (PyAV, repli cv2), proxy, masque d'exclusion, tampon circulaire
     hardware.py         # cœurs performance, sélection unique du device PyTorch
+    geometry.py         # warp anti-repliement exact, masques de couverture, coins
+    synthetic.py        # générateur de vidéos + vérité terrain, scénarios de référence
+    evaluation.py       # erreurs de pose (jauge), SSIM masqué, couverture, oracle
   tests/
     conftest.py, videofactory.py
     test_config.py, test_models.py, test_video_io.py, test_hardware.py,
-    test_cli.py, test_architecture.py
+    test_cli.py, test_architecture.py, test_synthetic.py, test_evaluation.py
 ```
 
-`hardware.py` ne figure pas dans l'arborescence initiale : il répond à l'exigence d'un module
-**unique** de sélection du device (et de comptage des cœurs performance), utilisé à la fois par la
-CLI, la GUI et les modules optionnels.
+Modules ajoutés à l'arborescence initiale :
+
+* `hardware.py` : exigence d'un module **unique** de sélection du device (et de comptage des cœurs
+  performance), utilisé par la CLI, la GUI et les modules optionnels ;
+* `geometry.py` : warp et masques partagés par le générateur, l'évaluation et (phase 4) la mosaïque ;
+* `synthetic.py`, `evaluation.py` : générateur et métriques de référence ; ils sont dans `core`
+  (et non dans `tests`) pour être utilisables en ligne de commande et par la GUI.
 
 ### Conventions
 
@@ -151,6 +205,17 @@ CLI, la GUI et les modules optionnels.
    officiel, chemin des poids configurable).
 9. **Frames manquantes** dans un flux endommagé : pas de trou dans les indices, mais `time_s` reste
    exact (testé sur un fichier tronqué).
+
+## Limites connues (phase 2)
+
+* Les panels procéduraux imitent la structure d'un manhwa (aplats cernés, trames, hachures,
+  bulles, texte) mais pas son style graphique : valider aussi avec `--panel-image` sur de vrais
+  panels.
+* Le fond flou suiveur (`blur_follow`) suit la translation du cadrage, pas son zoom.
+* La compression est simulée par un unique encodage x264/crf ; pas de bruit de capture ni de
+  ré-encodage multiple (cas réel des vidéos republiées).
+* `oracle_mosaic` garde toute la pile d'observations en mémoire (bornée par `max_stack_bytes`) :
+  c'est un outil d'évaluation, pas la fusion par tuiles de la phase 4.
 
 ## Limites connues (phase 1)
 

@@ -5,10 +5,13 @@ import subprocess
 import sys
 from pathlib import Path
 
+import cv2
+import numpy as np
 import pytest
 
-from panelrecon import cli
+from panelrecon import cli, synth_cli
 from panelrecon.core.config import PipelineConfig
+from panelrecon.core.synthetic import GroundTruth
 
 
 def test_write_default_config(tmp_path: Path) -> None:
@@ -76,3 +79,30 @@ def test_module_entry_point(tmp_path: Path, cfr_mp4: Path) -> None:
     )
     assert proc.returncode == 0, proc.stderr
     assert (out / cli.INVENTORY_FILENAME).is_file()
+
+
+# ------------------------------------------------------------ générateur synthétique
+
+
+def test_synth_cli_list_and_usage() -> None:
+    assert synth_cli.main(["--list"]) == 0
+    assert synth_cli.main([]) == 2
+
+
+def test_synth_cli_generates_and_evaluates_oracle(tmp_path: Path) -> None:
+    assert synth_cli.main(["-o", str(tmp_path), "-s", "short", "--oracle"]) == 0
+    gt = GroundTruth.load(tmp_path / "short_ground_truth.json")
+    assert gt.video_path.is_file() and len(gt.frames) == 4
+
+
+def test_synth_cli_custom_panel_image(tmp_path: Path) -> None:
+    noise = np.random.default_rng(0).integers(0, 256, (900, 1200, 3), dtype=np.uint8)
+    image = np.asarray(cv2.GaussianBlur(noise, (0, 0), 1.5), dtype=np.uint8)
+    panel = tmp_path / "mon_panel.png"
+    cv2.imwrite(str(panel), image)
+    out = tmp_path / "out"
+    assert synth_cli.main(["-o", str(out), "-s", "short", "--panel-image", str(panel)]) == 0
+    gt = GroundTruth.load(out / "short_ground_truth.json")
+    assert np.array_equal(gt.load_panel(0), image)
+    assert synth_cli.main(["-o", str(out), "-s", "short", "--panel-image",
+                           str(tmp_path / "absent.png")]) == 2

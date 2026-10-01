@@ -129,6 +129,50 @@ class SimilarityTransform:
         return cls(scale=scale, theta=math.atan2(q, p), tx=float(m[0, 2]), ty=float(m[1, 2]))
 
     @classmethod
+    def fit(
+        cls,
+        src: NDArray[Any],
+        dst: NDArray[Any],
+        weights: NDArray[Any] | None = None,
+        allow_rotation: bool = True,
+    ) -> SimilarityTransform:
+        """Similarité minimisant ``Σ wᵢ‖T(srcᵢ) − dstᵢ‖²`` (solution fermée d'Umeyama).
+
+        Avec ``allow_rotation=False``, la rotation est fixée à 0 (échelle + translation).
+        """
+        p = np.asarray(src, dtype=np.float64)
+        q = np.asarray(dst, dtype=np.float64)
+        if p.ndim != 2 or p.shape[1] != 2 or p.shape != q.shape:
+            raise ValueError(f"Points (N, 2) appariés attendus, reçu {p.shape} et {q.shape}")
+        if p.shape[0] < 2:
+            raise ValueError("Au moins deux correspondances sont nécessaires")
+        w = np.ones(p.shape[0]) if weights is None else np.asarray(weights, dtype=np.float64)
+        if w.shape != (p.shape[0],) or np.any(w < 0) or w.sum() <= 0:
+            raise ValueError("Poids invalides")
+        w = w / w.sum()
+        mu_p = w @ p
+        mu_q = w @ q
+        pc = p - mu_p
+        qc = q - mu_q
+        var_p = float(w @ (pc**2).sum(axis=1))
+        if var_p <= 1e-18:
+            raise ValueError("Points sources dégénérés (tous confondus)")
+        # Composantes de la covariance croisée utiles pour [[a, -b], [b, a]].
+        sxx = float(w @ (pc[:, 0] * qc[:, 0] + pc[:, 1] * qc[:, 1]))
+        sxy = float(w @ (pc[:, 0] * qc[:, 1] - pc[:, 1] * qc[:, 0]))
+        if allow_rotation:
+            a, b = sxx / var_p, sxy / var_p
+        else:
+            a, b = sxx / var_p, 0.0
+        scale = math.hypot(a, b)
+        if scale <= 1e-12:
+            raise ValueError("Échelle estimée nulle")
+        theta = math.atan2(b, a)
+        tx = float(mu_q[0] - (a * mu_p[0] - b * mu_p[1]))
+        ty = float(mu_q[1] - (b * mu_p[0] + a * mu_p[1]))
+        return cls(scale=scale, theta=theta, tx=tx, ty=ty)
+
+    @classmethod
     def from_translation(cls, tx: float, ty: float) -> SimilarityTransform:
         return cls(1.0, 0.0, tx, ty)
 

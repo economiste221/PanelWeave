@@ -14,10 +14,12 @@ import logging
 import math
 from collections import deque
 from collections.abc import Iterable, Iterator
+from fractions import Fraction
 from pathlib import Path
 from typing import Protocol
 
 import av
+import av.container
 import av.error
 import cv2
 import numpy as np
@@ -518,3 +520,112 @@ class VideoReader:
             proxy_gray=proxy_gray,
             proxy_factor=min(1.0, factor),
         )
+
+
+# ---------------------------------------------------------------------------
+# Encodage
+# ---------------------------------------------------------------------------
+
+_ENCODERS: dict[str, tuple[str, dict[str, str]]] = {
+    ".mp4": ("libx264", {"preset": "veryfast"}),
+    ".mov": ("libx264", {"preset": "veryfast"}),
+    ".mkv": ("libx264", {"preset": "veryfast"}),
+    ".webm": ("libvpx-vp9", {"b": "0", "deadline": "realtime", "cpu-used": "8"}),
+}
+# Base de temps des vidéos à fréquence variable : la milliseconde.
+VFR_TIME_BASE = Fraction(1, 1000)
+
+
+class VideoEncoder:
+    """Encodeur vidéo en flux (PyAV), frame par frame, à cadence fixe ou variable.
+
+    En mode ``variable_frame_rate``, :meth:`write` exige l'instant de chaque
+    frame ; il est arrondi à la milliseconde (base de temps du flux).
+    """
+
+    def __init__(
+        self,
+        path: Path,
+        width: int,
+        height: int,
+        fps: int,
+        crf: int = 18,
+        variable_frame_rate: bool = False,
+    ) -> None:
+        suffix = Path(path).suffix.lower()
+        if suffix not in _ENCODERS:
+            raise ValueError(f"Conteneur non supporté pour l'encodage : {suffix}")
+        if width <= 0 or height <= 0 or width % 2 or height % 2:
+            raise ValueError(f"Dimensions paires et positives requises (yuv420p) : {width}x{height}")
+        if fps <= 0:
+            raise ValueError("fps doit être > 0")
+        if not 0 <= crf <= 51:
+            raise ValueError("crf doit être dans [0, 51]")
+        codec, options = _ENCODERS[suffix]
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._width, self._height, self._fps = width, height, fps
+        self._vfr = variable_frame_rate
+        self._count = 0
+        self._last_pts: int | None = None
+        self._container: av.container.OutputContainer | None = av.open(str(self.path), mode="w")
+        try:
+            stream = self._container.add_stream(
+                codec, rate=fps, options={**options, "crf": str(crf)}
+            )
+            assert isinstance(stream, av.VideoStream)
+            stream.width = width
+            stream.height = height
+            stream.pix_fmt = "yuv420p"
+            if variable_frame_rate:
+                stream.codec_context.time_base = VFR_TIME_BASE
+            self._stream = stream
+        except BaseException:
+            self._container.close()
+            raise
+
+    def __enter__(self) -> VideoEncoder:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
+
+    @property
+    def frames_written(self) -> int:
+        return self._count
+
+    def write(self, image: ImageU8, time_s: float | None = None) -> float:
+        """Encode une frame BGR ; renvoie l'instant effectivement enregistré."""
+        if image.shape != (self._height, self._width, 3) or image.dtype != np.uint8:
+            raise ValueError(
+                f"Frame BGR uint8 {self._width}x{self._height} attendue, reçu {image.shape}"
+            )
+        frame = av.VideoFrame.from_ndarray(np.ascontiguousarray(image), format="bgr24")
+        if self._vfr:
+            if time_s is None:
+                raise ValueError("time_s est requis en mode fréquence variable")
+            pts = int(round(time_s * 1000))
+            frame.time_base = VFR_TIME_BASE
+        else:
+            pts = self._count
+            frame.time_base = Fraction(1, self._fps)
+        if self._last_pts is not None and pts <= self._last_pts:
+            raise ValueError(f"Timestamps non strictement croissants ({pts} après {self._last_pts})")
+        frame.pts = pts
+        if self._container is None:
+            raise RuntimeError("Encodeur déjà fermé")
+        for packet in self._stream.encode(frame):
+            self._container.mux(packet)
+        self._last_pts = pts
+        self._count += 1
+        return float(pts * frame.time_base)
+
+    def close(self) -> None:
+        if self._container is None:
+            return
+        try:
+            for packet in self._stream.encode():
+                self._container.mux(packet)
+        finally:
+            self._container.close()
+            self._container = None

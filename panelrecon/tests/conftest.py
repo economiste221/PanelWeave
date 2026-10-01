@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from panelrecon.core.config import PipelineConfig
+from panelrecon.core.synthetic import GroundTruth, generate_video, scenario
 from panelrecon.tests.videofactory import index_frame, write_video
 
 N_FRAMES = 24
@@ -39,3 +40,21 @@ def corrupt_mp4(tmp_path: Path) -> Path:
     path = tmp_path / "corrupt.mp4"
     path.write_bytes(bytes(range(256)) * 64)
     return path
+
+
+class SyntheticCache:
+    """Génère chaque scénario au plus une fois par session de tests."""
+
+    def __init__(self, root: Path) -> None:
+        self.root = root
+        self._cache: dict[str, GroundTruth] = {}
+
+    def get(self, name: str) -> GroundTruth:
+        if name not in self._cache:
+            self._cache[name] = generate_video(scenario(name), self.root / name)
+        return self._cache[name]
+
+
+@pytest.fixture(scope="session")
+def synthetic(tmp_path_factory: pytest.TempPathFactory) -> SyntheticCache:
+    return SyntheticCache(tmp_path_factory.mktemp("synthetic"))
