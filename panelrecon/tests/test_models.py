@@ -177,7 +177,7 @@ def test_mosaic_result_and_report() -> None:
     assert (crop.width, crop.height) == (20, 10)
     res = MosaicResult(
         sequence=Sequence(0, 3),
-        image_rgba=np.zeros((10, 20, 4), np.uint8),
+        image_bgra=np.zeros((10, 20, 4), np.uint8),
         coverage=np.zeros((10, 20), np.uint16),
         transforms={0: SimilarityTransform()},
         crop=crop,

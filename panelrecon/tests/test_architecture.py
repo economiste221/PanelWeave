@@ -13,6 +13,9 @@ CORE_MODULES = (
     "panelrecon.core.evaluation",
     "panelrecon.core.motion",
     "panelrecon.core.registration",
+    "panelrecon.core.mosaic",
+    "panelrecon.core.export",
+    "panelrecon.core.pipeline",
     "panelrecon.cli",
     "panelrecon.synth_cli",
 )

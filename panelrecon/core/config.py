@@ -233,6 +233,68 @@ class RegistrationConfig:
 
 
 @dataclass
+class MosaicConfig:
+    """Canevas canonique, warp et fusion des observations."""
+
+    interpolation: str = param(
+        "lanczos4", choices=("lanczos4", "cubic"), help="Interpolation du warp des frames."
+    )
+    max_canvas_megapixels: float = param(
+        400.0, minimum=0.01, maximum=100000.0, help="Taille maximale du canevas (mégapixels)."
+    )
+    frame_border_px: int = param(
+        2, minimum=0, maximum=200, help="Bande exclue le long des bords de l'écran (px natifs)."
+    )
+    mask_erode_px: int = param(
+        3,
+        minimum=0,
+        maximum=200,
+        help="Érosion du masque de validité avant warp (support du noyau d'interpolation).",
+    )
+    edge_feather_px: float = param(
+        12.0,
+        minimum=0.0,
+        maximum=10000.0,
+        help="Largeur (px natifs) de la rampe de poids près des bords du masque.",
+    )
+    min_edge_weight: float = param(
+        0.05, minimum=0.001, maximum=1.0, help="Poids minimal d'un pixel valide en bord de masque."
+    )
+    scale_weight_power: float = param(
+        2.0,
+        minimum=0.0,
+        maximum=8.0,
+        help="Poids ∝ (1 / échelle frame→canevas)^p : favorise les frames les plus zoomées.",
+    )
+    tile_size: int = param(256, minimum=16, maximum=8192, help="Côté des tuiles de fusion (px).")
+    min_coverage: int = param(
+        1, minimum=1, maximum=100000, help="Observations minimales pour qu'un pixel soit opaque."
+    )
+    crop_mode: str = param(
+        "bbox",
+        choices=("bbox", "covered"),
+        help="bbox : rectangle englobant de la zone couverte (trous transparents) ; covered : "
+        "rectangle rogné jusqu'à être entièrement couvert.",
+    )
+    in_memory_stack_mb: float = param(
+        1024.0,
+        minimum=0.0,
+        maximum=1e6,
+        help="Au-delà, la pile des observations warpées est stockée sur disque (memmap).",
+    )
+    temp_dir: str = param("", help="Dossier temporaire de la pile sur disque (vide = système).")
+
+
+@dataclass
+class ExportConfig:
+    """Fichiers produits."""
+
+    save_coverage_map: bool = param(True, help="Carte de couverture (PNG 16 bits + fausses couleurs).")
+    save_registration: bool = param(True, help="Transformations et estimations dans le rapport.")
+    png_compression: int = param(3, minimum=0, maximum=9, help="Niveau de compression PNG.")
+
+
+@dataclass
 class RuntimeConfig:
     """Paramètres d'exécution : reproductibilité, matériel, parallélisme, journalisation."""
 
@@ -261,6 +323,8 @@ class PipelineConfig:
     preprocess: PreprocessConfig = field(default_factory=PreprocessConfig)
     motion: MotionConfig = field(default_factory=MotionConfig)
     registration: RegistrationConfig = field(default_factory=RegistrationConfig)
+    mosaic: MosaicConfig = field(default_factory=MosaicConfig)
+    export: ExportConfig = field(default_factory=ExportConfig)
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
     schema_version: int = CONFIG_SCHEMA_VERSION
 

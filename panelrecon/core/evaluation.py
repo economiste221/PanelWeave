@@ -242,10 +242,10 @@ def evaluate_mosaic(
     size = (result.crop.width, result.crop.height)
     reference = np.asarray(warp_similarity(panel, panel_to_crop, size), dtype=np.uint8)
     observable = observable_mask(gt, shot_id, panel_to_crop, size)
-    covered = result.image_rgba[..., 3] > 0
+    covered = result.image_bgra[..., 3] > 0
     obs = observable > 0
     both = (covered & obs).astype(np.uint8) * 255
-    recon_bgr = np.ascontiguousarray(result.image_rgba[..., :3])
+    recon_bgr = np.ascontiguousarray(result.image_bgra[..., :3])
     ssim = masked_ssim(recon_bgr, reference, both)
     diff = recon_bgr[both > 0].astype(np.float64) - reference[both > 0].astype(np.float64)
     mse = float(np.mean(diff**2))
@@ -342,7 +342,7 @@ def oracle_mosaic(
     indices = sorted(transforms)
     return MosaicResult(
         sequence=Sequence(min(indices), max(indices)),
-        image_rgba=np.ascontiguousarray(rgba[sl]),
+        image_bgra=np.ascontiguousarray(rgba[sl]),
         coverage=np.ascontiguousarray(coverage[sl]),
         transforms=transforms,
         crop=crop,

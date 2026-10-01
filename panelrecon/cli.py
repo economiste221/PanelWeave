@@ -7,6 +7,11 @@ Usage ::
 
 Modes disponibles à ce stade :
 
+* ``reconstruct`` (défaut) : reconstruit le panel de chaque vidéo (traitée comme
+  une séquence unique jusqu'à la phase 5) et écrit, dans ``<sortie>/<vidéo>/``,
+  le PNG RGBA, la carte de couverture et le rapport JSON ; ``batch_report.json``
+  résume le lot.
+
 * ``inventory`` : découvre les vidéos, les décode intégralement en flux et écrit
   ``inventory.json`` (métadonnées, nombre de frames, statistiques des
   intervalles de temps pour détecter la fréquence variable, erreurs). Une vidéo
@@ -39,6 +44,8 @@ from panelrecon import __version__
 from panelrecon.core.config import ConfigError, PipelineConfig
 from panelrecon.core.hardware import resolve_num_workers, select_torch_device
 from panelrecon.core.models import CancellationToken, OperationCancelled
+from panelrecon.core.export import write_json
+from panelrecon.core.pipeline import VideoOutcome, process_video
 from panelrecon.core.registration import RegistrationResult, register_frames
 from panelrecon.core.video_io import VideoError, VideoReader, discover_videos
 
@@ -50,6 +57,7 @@ EXIT_USAGE = 2
 EXIT_INTERRUPTED = 130
 
 INVENTORY_FILENAME = "inventory.json"
+BATCH_REPORT_FILENAME = "batch_report.json"
 LOG_FILENAME = "panelrecon.log"
 # Écart relatif entre intervalles extrêmes au-delà duquel la vidéo est jugée VFR.
 _VFR_RELATIVE_SPREAD = 0.05
@@ -85,9 +93,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", "-c", type=Path, help="Fichier de configuration JSON.")
     parser.add_argument(
         "--mode",
-        choices=("inventory", "register"),
-        default="inventory",
-        help="Traitement à exécuter (défaut : inventory).",
+        choices=("reconstruct", "inventory", "register"),
+        default="reconstruct",
+        help="Traitement à exécuter (défaut : reconstruct).",
     )
     parser.add_argument(
         "--log-level",
@@ -274,6 +282,33 @@ def run_register(
     return results
 
 
+def run_reconstruct(
+    inputs: Sequence[Path],
+    output_dir: Path,
+    config: PipelineConfig,
+    cancel: CancellationToken | None = None,
+) -> list[VideoOutcome]:
+    """Reconstruit chaque vidéo ; une vidéo en échec est rapportée sans arrêter le lot."""
+    videos = discover_videos(inputs, config.video.extensions, config.video.recursive)
+    logger.info("%d vidéo(s) trouvée(s)", len(videos))
+    outcomes: list[VideoOutcome] = []
+    for n, path in enumerate(videos, start=1):
+        logger.info("[%d/%d] %s", n, len(videos), path)
+        outcome = process_video(path, output_dir, config, cancel=cancel)
+        logger.info("  %s en %.1f s", "OK" if outcome.ok else f"ÉCHEC : {outcome.error}",
+                    outcome.elapsed_s)
+        outcomes.append(outcome)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    write_json(output_dir / BATCH_REPORT_FILENAME, {
+        "panelrecon_version": __version__,
+        "config": config.to_dict(),
+        "videos": [o.to_dict() for o in outcomes],
+        "n_ok": sum(o.ok for o in outcomes),
+        "n_failed": sum(not o.ok for o in outcomes),
+    })
+    return outcomes
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -311,15 +346,19 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     cancel = CancellationToken()
     try:
-        runner = run_register if args.mode == "register" else run_inventory
-        results = runner(args.input, output_dir, config, cancel)
+        if args.mode == "reconstruct":
+            outcomes = run_reconstruct(args.input, output_dir, config, cancel)
+            statuses = [o.ok for o in outcomes]
+        else:
+            runner = run_register if args.mode == "register" else run_inventory
+            statuses = [r.status == "ok" for r in runner(args.input, output_dir, config, cancel)]
     except (KeyboardInterrupt, OperationCancelled):
         logger.warning("Traitement interrompu")
         return EXIT_INTERRUPTED
-    if not results:
+    if not statuses:
         logger.error("Aucune vidéo trouvée dans les entrées fournies")
         return EXIT_FAILURES
-    return EXIT_FAILURES if any(r.status != "ok" for r in results) else EXIT_OK
+    return EXIT_OK if all(statuses) else EXIT_FAILURES
 
 
 if __name__ == "__main__":

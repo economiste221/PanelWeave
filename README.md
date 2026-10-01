@@ -17,7 +17,7 @@ vidéo → séquences → segmentation panel/fond → mouvement inter-frames →
 | 1 | Squelette, configuration, modèles, `video_io`, détection matérielle, CLI (`inventory`) | ✅ |
 | 2 | Générateur synthétique avec vérité terrain, métriques d'évaluation, reconstruction oracle | ✅ |
 | 3 | Mouvement (SIFT/ORB + RANSAC + ECC, replis flot dense et corrélation log-polaire), chaînage | ✅ |
-| 4 | Mosaïque, fusion médiane, couverture, export | à faire |
+| 4 | Mosaïque, fusion médiane pondérée par tuiles, couverture, recadrage, export, pipeline | ✅ |
 | 5 | Segmentation classique, découpage en séquences | à faire |
 | 6 | Recalage sur mosaïque, ajustement global | à faire |
 | 7 | Contrôle qualité, rapport | à faire |
@@ -54,21 +54,75 @@ pip install -r requirements-dev.txt     # ou requirements.txt sans les outils de
 pip install -e . --no-deps              # rend la commande `panelrecon` disponible
 ```
 
-## Utilisation (phase 1)
+## Utilisation
 
 ```bash
 # Écrire la configuration par défaut (point de départ d'un profil)
 python -m panelrecon.cli --write-default-config profils/defaut.json
 
-# Inventaire d'un lot : découverte récursive, décodage complet en flux, statistiques temporelles
+# Reconstruction d'un lot (mode par défaut)
 python -m panelrecon.cli --input ~/Videos/manhwa --output ~/Videos/sortie --config profils/defaut.json
+
+# Inventaire seul : découverte récursive, décodage complet en flux, statistiques temporelles
+python -m panelrecon.cli --mode inventory --input ~/Videos/manhwa --output ~/Videos/sortie
 ```
+
+Le mode `reconstruct` produit, pour chaque vidéo, dans `<sortie>/<vidéo>/` :
+
+* `<vidéo>_seq000_<début>-<fin>.png` : panel reconstruit, PNG RGBA ; les pixels jamais observés
+  sont transparents (alpha = 0), aucun contenu n'est inventé ;
+* `…_coverage.png` (16 bits, nombre d'observations par pixel) et `…_coverage_color.png` ;
+* `…json` : séquence, taille, échelle canonique, recadrage, statistiques de couverture, recalage
+  (transformations, estimations, rejets).
+
+`batch_report.json` résume le lot ; une vidéo en échec est rapportée avec sa trace sans arrêter
+les suivantes.
 
 Le mode `inventory` écrit `inventory.json` (métadonnées, frames décodées/conservées, erreurs de
 décodage, intervalles min/médian/max, détection de fréquence variable) et `panelrecon.log`.
 Une vidéo illisible est journalisée avec sa trace sans interrompre le lot.
 Codes de sortie : `0` succès, `1` au moins une vidéo en échec, `2` erreur d'usage/configuration,
 `130` interruption.
+
+## Mosaïque et fusion (phase 4)
+
+`core/mosaic.py` :
+
+1. **Canevas** : englobe toutes les frames recalées dans le repère canonique (échelle de la frame la
+   plus zoomée) ; `CanvasTooLargeError` explicite au-delà de `mosaic.max_canvas_megapixels`.
+2. **Observations** : chaque frame est warpée (Lanczos4, ou bicubique) sur sa seule emprise, avec un
+   masque de validité = panel ∩ hors bande de bord d'écran ∩ hors zones d'exclusion, érodé du support
+   du noyau ; un pixel n'est valide que s'il est entièrement couvert par la zone valide. Pile
+   `(n, H, W, 4)` uint8 (BGR + poids de bord quantifié), en mémoire ou en memmap sur disque au-delà
+   de `mosaic.in_memory_stack_mb` (dossier temporaire supprimé ensuite).
+3. **Fusion par tuiles** (`mosaic.tile_size`) : médiane pondérée vectorisée par canal ; poids =
+   rampe de distance au bord du masque × (1 / échelle frame→canevas)^p (`scale_weight_power`, 2 par
+   défaut : un pixel de frame couvrant 2×2 pixels de canevas pèse 4 fois moins). Les observations
+   minoritaires (sous-titre fixe, artefact) sont rejetées.
+4. **Couverture et recadrage** : couverture = nombre d'observations valides ; alpha = 255 si
+   couverture ≥ `min_coverage` ; recadrage `bbox` (rectangle englobant, trous transparents) ou
+   `covered` (rognage glouton jusqu'à couverture totale).
+
+`core/pipeline.py` orchestre une vidéo : passe 1 recalage sur images réduites, passe 2 décodage
+natif et fusion, puis export ; progression `(fraction, message)` et annulation coopérative.
+
+Résultats (recalage estimé en phase 3 + fusion, masques de panel exacts de la vérité terrain,
+vidéos encodées crf 14), comparés au panel original rééchantillonné à l'échelle canonique :
+
+| Scénario | SSIM | PSNR | couverture réelle | surestimation |
+|---|---|---|---|---|
+| static | 0,978 | 32,7 dB | 1,000 | 0 |
+| pan_horizontal / pan_vertical | 0,989 / 0,979 | 35,7 / 32,4 dB | 1,000 / 1,000 | 0 |
+| zoom_in / zoom_out | 0,967 / 0,966 | 30,7 / 30,7 dB | 1,000 / 1,000 | 0 |
+| pan_zoom_eased | 0,981 | 33,3 dB | 0,992 | 0 |
+| duplicates | 0,989 | 35,8 dB | 1,000 | 0 |
+| crossfade (2 plans) | 0,989 / 0,975 | 35,8 / 31,3 dB | 1,000 / 1,000 | 0 |
+| subtitles | 0,983 | 35,3 dB | 1,000 | 0 |
+| flat_texture | 0,997 | 40,2 dB | 1,000 | 0 |
+| short / vfr | 0,982 / 0,981 | 33,6 / 33,2 dB | 0,996 / 0,992 | 0 |
+
+Ces valeurs égalent ou dépassent la reconstruction oracle à poses exactes de la phase 2 (la
+pondération par l'échelle favorise les frames les plus zoomées : `zoom_in` 0,967 contre 0,964).
 
 ## Mouvement et recalage (phase 3)
 
@@ -184,6 +238,10 @@ ses choix et un texte d'aide (réutilisés par l'interface en phase 8). Sections
   maximale, exigence pour les replis), score de cohérence minimal et taille des tuiles,
   recouvrement minimal, replis (flot, corrélation de phase) et leurs seuils ;
 * `registration` : nombre d'échecs consécutifs tolérés ;
+* `mosaic` : interpolation, taille maximale du canevas, bande de bord d'écran, érosion du masque,
+  rampe et poids minimal de bord, puissance du poids d'échelle, taille des tuiles, couverture
+  minimale, mode de recadrage, seuil de pile sur disque et dossier temporaire ;
+* `export` : carte de couverture, transformations dans le rapport, compression PNG ;
 * `runtime` : graine, device (`auto` = CUDA → MPS → CPU), nombre de workers
   (`0` = cœurs performance via `sysctl hw.perflevel0.physicalcpu`), niveau de journalisation.
 
@@ -193,8 +251,9 @@ compatibilité des profils).
 ## Validation
 
 ```bash
-python -m pytest            # 170 tests (~2 min 30) : config, modèles, video_io, matériel, CLI,
-                            # générateur synthétique, évaluation, oracle, mouvement, recalage
+python -m pytest            # 209 tests (~6 min) : config, modèles, video_io, matériel, CLI,
+                            # générateur synthétique, évaluation, oracle, mouvement, recalage,
+                            # mosaïque, export, pipeline
 python -m mypy              # mode strict sur tout le paquet
 ```
 
@@ -216,11 +275,14 @@ panelrecon/
     evaluation.py       # erreurs de pose (jauge), SSIM masqué, couverture, oracle
     motion.py           # estimation de similarité inter-frames (cascade + ECC + validation)
     registration.py     # recalage par chaînage, repère canonique
+    mosaic.py           # canevas, warp + masques de validité, médiane pondérée par tuiles
+    export.py           # PNG RGBA, couverture, rapport JSON
+    pipeline.py         # orchestration d'une vidéo (progression, annulation, erreurs capturées)
   tests/
     conftest.py, videofactory.py
     test_config.py, test_models.py, test_video_io.py, test_hardware.py,
     test_cli.py, test_architecture.py, test_synthetic.py, test_evaluation.py,
-    test_motion.py, test_registration.py
+    test_motion.py, test_registration.py, test_mosaic.py, test_pipeline.py
 ```
 
 Modules ajoutés à l'arborescence initiale :
@@ -267,6 +329,24 @@ Modules ajoutés à l'arborescence initiale :
    officiel, chemin des poids configurable).
 9. **Frames manquantes** dans un flux endommagé : pas de trou dans les indices, mais `time_s` reste
    exact (testé sur un fichier tronqué).
+
+## Limites connues (phase 4)
+
+* **Sans segmentation (phase 5)**, tout le contenu de l'écran est fusionné : quand le fond flou est
+  visible, il est reconstruit autour du panel et compté comme couvert (surestimation de couverture
+  de 14 % sur `zoom_in`, 41 % sur `static`). Les tests de référence de la fusion utilisent donc les
+  masques exacts ; sans masque, ils passent lorsque le panel remplit l'écran.
+* **Une vidéo = une séquence** jusqu'à la phase 5. Un changement de panel par coupe franche
+  interrompt le recalage (seul le premier panel est exporté, avec un avertissement) ; un **fondu
+  enchaîné** est en revanche franchi par le chaînage et les deux panels sont fusionnés : le
+  découpage en séquences (phase 5) est indispensable sur de telles vidéos.
+* Un sous-titre fixe laisse une trace faible là où le panel n'est vu que par peu de frames
+  couvertes par le texte ; la détection automatique des éléments fixes est prévue avec la
+  segmentation (phase 5). La zone d'exclusion configurable règle le cas dès maintenant.
+* Le canevas est dimensionné sur l'emprise des frames entières (les masques ne sont connus qu'au
+  parcours) : la pile d'observations est donc plus grande que nécessaire quand le panel n'occupe
+  qu'une partie de l'écran ; le recadrage final n'en dépend pas.
+* Aucun inpainting : les trous restent transparents (option explicite éventuelle en phase 7).
 
 ## Limites connues (phase 3)
 

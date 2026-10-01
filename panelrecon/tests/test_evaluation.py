@@ -176,14 +176,14 @@ def test_oracle_reconstruction_meets_reference_thresholds(
     # Canevas à l'échelle maximale observée : aucune perte de résolution.
     assert result.canvas_scale == pytest.approx(gt.max_scale(shot_id))
     assert result.coverage.max() >= 1
-    assert np.array_equal(result.image_rgba[..., 3] > 0, result.coverage > 0)
+    assert np.array_equal(result.image_bgra[..., 3] > 0, result.coverage > 0)
 
 
 def test_evaluation_detects_misregistration(synthetic: SyntheticCache) -> None:
     """Une reconstruction décalée de 3 px doit échouer aux seuils de référence."""
     gt = synthetic.get("pan_horizontal")
     good = _oracle(gt, 0)
-    shifted_rgba = np.roll(good.image_rgba, 3, axis=1)
+    shifted_rgba = np.roll(good.image_bgra, 3, axis=1)
     bad = MosaicResult(good.sequence, shifted_rgba, np.roll(good.coverage, 3, axis=1),
                        good.transforms, good.crop, good.canvas_scale)
     metrics = evaluate_mosaic(bad, gt, 0)
@@ -192,7 +192,7 @@ def test_evaluation_detects_misregistration(synthetic: SyntheticCache) -> None:
     # Poses faussées de 1 % d'échelle : détectées par la métrique de pose.
     scaled = {i: SimilarityTransform(1.01) @ t for i, t in good.transforms.items()}
     scaled[min(scaled)] = good.transforms[min(scaled)]
-    skewed = MosaicResult(good.sequence, good.image_rgba, good.coverage, scaled, good.crop,
+    skewed = MosaicResult(good.sequence, good.image_bgra, good.coverage, scaled, good.crop,
                           good.canvas_scale)
     assert evaluate_mosaic(skewed, gt, 0).pose.max_scale_rel > 0.005
 
@@ -202,7 +202,7 @@ def test_coverage_overreach_is_reported(synthetic: SyntheticCache) -> None:
     gt = synthetic.get("pan_vertical")
     good = _oracle(gt, 0)
     pad = 20
-    rgba = np.pad(good.image_rgba, ((pad, pad), (pad, pad), (0, 0)), constant_values=255)
+    rgba = np.pad(good.image_bgra, ((pad, pad), (pad, pad), (0, 0)), constant_values=255)
     coverage = np.pad(good.coverage, pad, constant_values=1)
     crop = CropBox(good.crop.x0 - pad, good.crop.y0 - pad, good.crop.x1 + pad, good.crop.y1 + pad)
     metrics = evaluate_mosaic(

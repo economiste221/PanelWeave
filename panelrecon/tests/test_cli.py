@@ -35,7 +35,8 @@ def test_inventory_mixed_batch(
     tmp_path: Path, cfr_mp4: Path, vfr_mkv: Path, corrupt_mp4: Path
 ) -> None:
     out = tmp_path / "out"
-    code = cli.main(["--input", str(tmp_path), "--output", str(out), "--log-level", "WARNING"])
+    code = cli.main(["--mode", "inventory", "--input", str(tmp_path), "--output", str(out),
+                     "--log-level", "WARNING"])
     assert code == cli.EXIT_FAILURES  # la vidéo corrompue fait échouer le lot…
     report = json.loads((out / cli.INVENTORY_FILENAME).read_text(encoding="utf-8"))
     by_name = {Path(v["path"]).name: v for v in report["videos"]}
@@ -57,7 +58,8 @@ def test_inventory_with_config_ok(tmp_path: Path, cfr_mp4: Path) -> None:
     cfg_path = tmp_path / "cfg.json"
     cfg.save(cfg_path)
     out = tmp_path / "out"
-    assert cli.main(["-i", str(cfr_mp4), "-o", str(out), "-c", str(cfg_path)]) == cli.EXIT_OK
+    assert cli.main(["--mode", "inventory", "-i", str(cfr_mp4), "-o", str(out), "-c",
+                     str(cfg_path)]) == cli.EXIT_OK
     report = json.loads((out / cli.INVENTORY_FILENAME).read_text(encoding="utf-8"))
     assert report["videos"][0]["frames_kept"] == 12
     assert report["config"]["video"]["frame_step"] == 2
@@ -72,7 +74,8 @@ def test_no_video_found(tmp_path: Path) -> None:
 def test_module_entry_point(tmp_path: Path, cfr_mp4: Path) -> None:
     out = tmp_path / "out"
     proc = subprocess.run(
-        [sys.executable, "-m", "panelrecon.cli", "-i", str(cfr_mp4), "-o", str(out)],
+        [sys.executable, "-m", "panelrecon.cli", "--mode", "inventory", "-i", str(cfr_mp4),
+         "-o", str(out)],
         capture_output=True,
         text=True,
         timeout=120,

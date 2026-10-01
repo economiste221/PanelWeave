@@ -427,12 +427,13 @@ class MosaicResult:
     """Panel reconstruit pour une séquence.
 
     ``transforms[i]`` envoie les coordonnées natives de la frame ``i`` vers les
-    coordonnées du canevas **avant** recadrage. ``image_rgba`` et ``coverage``
-    sont déjà recadrés sur ``crop``.
+    coordonnées du canevas **avant** recadrage. ``image_bgra`` (canaux dans l'ordre
+    OpenCV ; alpha = 0 sur les pixels jamais observés) et ``coverage`` (nombre
+    d'observations valides par pixel) sont déjà recadrés sur ``crop``.
     """
 
     sequence: Sequence
-    image_rgba: ImageU8
+    image_bgra: ImageU8
     coverage: NDArray[np.uint16]
     transforms: dict[int, SimilarityTransform]
     crop: CropBox
@@ -440,8 +441,8 @@ class MosaicResult:
 
     def __post_init__(self) -> None:
         h, w = self.coverage.shape
-        if self.image_rgba.shape != (h, w, 4) or self.image_rgba.dtype != np.uint8:
-            raise ValueError("image_rgba doit être (H, W, 4) uint8, de même taille que coverage")
+        if self.image_bgra.shape != (h, w, 4) or self.image_bgra.dtype != np.uint8:
+            raise ValueError("image_bgra doit être (H, W, 4) uint8, de même taille que coverage")
         if (self.crop.height, self.crop.width) != (h, w):
             raise ValueError("Les dimensions de crop ne correspondent pas à l'image")
         if self.canvas_scale <= 0.0:
