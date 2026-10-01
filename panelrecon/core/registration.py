@@ -131,8 +131,26 @@ class ChainRegistrar:
     def interrupted(self) -> bool:
         return self._interrupted
 
-    def add(self, frame: MotionFrame, native_size: tuple[int, int]) -> MotionEstimate | None:
-        """Recale ``frame`` ; renvoie l'estimation (``None`` pour la première frame)."""
+    @property
+    def anchor(self) -> MotionFrame | None:
+        """Dernière frame acceptée (cible de la prochaine estimation)."""
+        return self._anchor
+
+    def transform_of(self, index: int) -> SimilarityTransform:
+        """Transformation native ``frame → frame de référence`` d'une frame recalée."""
+        return self._to_reference[index]
+
+    def add(
+        self,
+        frame: MotionFrame,
+        native_size: tuple[int, int],
+        estimate: MotionEstimate | None = None,
+    ) -> MotionEstimate | None:
+        """Recale ``frame`` ; renvoie l'estimation (``None`` pour la première frame).
+
+        ``estimate`` permet de fournir une estimation déjà calculée de ``frame`` vers
+        l'ancre courante (elle n'est alors pas recalculée).
+        """
         if self._interrupted:
             raise RuntimeError(f"Séquence interrompue : {self._reason}")
         if self._anchor is None:
@@ -143,7 +161,13 @@ class ChainRegistrar:
             return None
         if frame.index <= self._anchor.index:
             raise ValueError(f"Indices non croissants : {frame.index} après {self._anchor.index}")
-        estimate = self.estimator.estimate(frame, self._anchor)
+        if estimate is None:
+            estimate = self.estimator.estimate(frame, self._anchor)
+        elif (estimate.src_index, estimate.dst_index) != (frame.index, self._anchor.index):
+            raise ValueError(
+                f"Estimation {estimate.src_index}→{estimate.dst_index} fournie pour "
+                f"{frame.index}→{self._anchor.index}"
+            )
         if not estimate.accepted:
             self._rejected.append(estimate)
             self._excluded.append(frame.index)

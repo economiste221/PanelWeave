@@ -7,20 +7,20 @@ Usage ::
 
 Modes disponibles à ce stade :
 
-* ``reconstruct`` (défaut) : reconstruit le panel de chaque vidéo (traitée comme
-  une séquence unique jusqu'à la phase 5) et écrit, dans ``<sortie>/<vidéo>/``,
-  le PNG RGBA, la carte de couverture et le rapport JSON ; ``batch_report.json``
-  résume le lot.
+* ``reconstruct`` (défaut) : découpe chaque vidéo en séquences (un panel par
+  séquence), segmente et reconstruit chaque panel et écrit, dans
+  ``<sortie>/<vidéo>/``, un PNG RGBA, une carte de couverture et un rapport JSON
+  par séquence, plus ``<vidéo>_sequences.json`` ; ``batch_report.json`` résume
+  le lot.
 
 * ``inventory`` : découvre les vidéos, les décode intégralement en flux et écrit
   ``inventory.json`` (métadonnées, nombre de frames, statistiques des
   intervalles de temps pour détecter la fréquence variable, erreurs). Une vidéo
   illisible est journalisée avec sa trace et n'interrompt pas le lot.
 
-* ``register`` : recale chaque vidéo (traitée comme une séquence unique, le
-  découpage en séquences arrivant en phase 5) et écrit
-  ``<vidéo>_registration.json`` : transformations frame → repère canonique,
-  estimations acceptées et rejetées.
+* ``register`` : découpe chaque vidéo en séquences, les recale et écrit
+  ``<vidéo>_registration.json`` : séquences, transitions (frames écartées),
+  transformations frame → repère canonique, estimations acceptées.
 
 Codes de sortie : 0 = succès, 1 = au moins une vidéo en échec,
 2 = erreur d'usage ou de configuration, 130 = interruption.
@@ -46,7 +46,8 @@ from panelrecon.core.hardware import resolve_num_workers, select_torch_device
 from panelrecon.core.models import CancellationToken, OperationCancelled
 from panelrecon.core.export import write_json
 from panelrecon.core.pipeline import VideoOutcome, process_video
-from panelrecon.core.registration import RegistrationResult, register_frames
+from panelrecon.core.registration import RegistrationResult
+from panelrecon.core.scene_split import split_and_register
 from panelrecon.core.video_io import VideoError, VideoReader, discover_videos
 
 logger = logging.getLogger("panelrecon.cli")
@@ -225,14 +226,10 @@ def run_inventory(
     return results
 
 
-def registration_report(result: RegistrationResult, info: dict[str, Any]) -> dict[str, Any]:
+def registration_report(result: RegistrationResult) -> dict[str, Any]:
     return {
-        "panelrecon_version": __version__,
-        "video": info,
         "reference_index": result.reference_index,
         "canonical_scale": result.canonical_scale,
-        "interrupted": result.interrupted,
-        "interruption_reason": result.interruption_reason,
         "mean_inlier_ratio": result.mean_inlier_ratio,
         "min_inlier_ratio": result.min_inlier_ratio,
         "rms_reprojection_error": result.rms_reprojection_error,
@@ -249,7 +246,7 @@ def run_register(
     config: PipelineConfig,
     cancel: CancellationToken | None = None,
 ) -> list[VideoInventory]:
-    """Recale chaque vidéo comme une séquence unique ; une erreur n'arrête pas le lot."""
+    """Découpe et recale chaque vidéo ; une erreur n'arrête pas le lot."""
     videos = discover_videos(inputs, config.video.extensions, config.video.recursive)
     logger.info("%d vidéo(s) trouvée(s)", len(videos))
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -261,16 +258,25 @@ def run_register(
         try:
             with VideoReader(path, config.video, config.preprocess, cancel=cancel) as reader:
                 entry.info = reader.info.to_dict()
-                result = register_frames(reader.frames(), config, cancel=cancel)
+                split = split_and_register(reader.frames(), config, cancel)
                 entry.frames_decoded = reader.frames_decoded
                 entry.decode_errors = reader.decode_errors
-            entry.frames_kept = len(result.transforms)
-            report = registration_report(result, entry.info)
-            out = output_dir / f"{path.stem}_registration.json"
-            out.write_text(json.dumps(report, indent=1, ensure_ascii=False) + "\n", encoding="utf-8")
-            if result.interrupted:
+            entry.frames_kept = sum(len(s.registration.transforms) for s in split.sequences)
+            report = {
+                "panelrecon_version": __version__,
+                "video": entry.info,
+                "sequences": [
+                    {"sequence": s.sequence.to_dict(), **registration_report(s.registration)}
+                    for s in split.sequences
+                ],
+                "transitions": [t.to_dict() for t in split.transitions],
+                "dropped_sequences": [s.to_dict() for s in split.dropped],
+                "discarded_frames": split.discarded,
+            }
+            write_json(output_dir / f"{path.stem}_registration.json", report)
+            if not split.sequences:
                 entry.status = "error"
-                entry.error = f"Recalage interrompu : {result.interruption_reason}"
+                entry.error = "Aucune séquence exploitable"
         except OperationCancelled:
             raise
         except (VideoError, OSError, ValueError) as exc:

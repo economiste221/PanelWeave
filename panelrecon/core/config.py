@@ -233,6 +233,133 @@ class RegistrationConfig:
 
 
 @dataclass
+class SceneConfig:
+    """Découpage de la vidéo en séquences (une séquence = un panel)."""
+
+    use_scenedetect: bool = param(True, help="Coupures détectées par PySceneDetect (ContentDetector).")
+    content_threshold: float = param(
+        27.0, minimum=1.0, maximum=255.0, help="Seuil du ContentDetector de PySceneDetect."
+    )
+    thumbnail_width: int = param(
+        160, minimum=16, maximum=2048, help="Largeur des vignettes d'histogramme et de PySceneDetect."
+    )
+    histogram_min_correlation: float = param(
+        0.9,
+        minimum=-1.0,
+        maximum=1.0,
+        help="Corrélation minimale des histogrammes HSV de deux frames consécutives ; en dessous, "
+        "la paire est considérée en changement (coupe ou fondu).",
+    )
+    dissolve_lag: int = param(
+        4, minimum=2, maximum=100, help="Écart (frames) du contrôle de stabilité du contenu recalé."
+    )
+    dissolve_min_score: float = param(
+        0.8,
+        minimum=-1.0,
+        maximum=1.0,
+        help="Score de cohérence structurelle minimal entre une frame et celle située "
+        "dissolve_lag frames avant (recalées) ; en dessous, changement progressif détecté.",
+    )
+    merge_min_score: float = param(
+        0.9,
+        minimum=-1.0,
+        maximum=1.0,
+        help="Après une transition, score minimal pour considérer que le panel est le même "
+        "(frame parasite isolée) et réunir les deux morceaux.",
+    )
+    max_transition_frames: int = param(
+        120,
+        minimum=1,
+        maximum=100000,
+        help="Longueur maximale d'une transition gardée en mémoire (frames réduites).",
+    )
+    min_sequence_frames: int = param(
+        1, minimum=1, maximum=100000, help="Séquences plus courtes ignorées (journalisées)."
+    )
+
+
+@dataclass
+class SegmentationConfig:
+    """Séparation panel / fond."""
+
+    method: str = param(
+        "classic",
+        choices=("classic", "none"),
+        help="classic : netteté + cohérence de mouvement + rectangle ; none : toute la frame.",
+    )
+    sharpness_window: int = param(
+        9, minimum=3, maximum=101, help="Fenêtre (impaire, px réduits) de la variance du Laplacien."
+    )
+    sharpness_abs_threshold: float = param(
+        20.0, minimum=0.0, maximum=1e6, help="Variance du Laplacien minimale d'un pixel net."
+    )
+    sharpness_rel_threshold: float = param(
+        0.02,
+        minimum=0.0,
+        maximum=1.0,
+        help="Seuil relatif de netteté (fraction du 99e percentile de la frame).",
+    )
+    min_sharp_ratio: float = param(
+        0.3,
+        minimum=0.0,
+        maximum=1.0,
+        help="Fraction minimale des observations où un point du canevas est net pour être "
+        "une preuve de panel.",
+    )
+    min_displacement_px: float = param(
+        4.0,
+        minimum=0.0,
+        maximum=1000.0,
+        help="Déplacement minimal à l'écran (px réduits) d'un point du canevas pour que sa "
+        "variation temporelle soit exploitable.",
+    )
+    panel_max_std: float = param(
+        6.0,
+        minimum=0.0,
+        maximum=255.0,
+        help="Segmenteur image par image : écart maximal d'un pixel qui suit le mouvement du panel.",
+    )
+    boundary_band_px: int = param(
+        4, minimum=1, maximum=100, help="Largeur (px réduits) de la bande de recherche d'une bordure."
+    )
+    boundary_min_fraction: float = param(
+        0.6,
+        minimum=0.0,
+        maximum=1.0,
+        help="Fraction minimale d'un côté occupée par une ligne nette pour le considérer comme "
+        "la bordure du panel.",
+    )
+    background_std_ratio: float = param(
+        3.0,
+        minimum=1.0,
+        maximum=1000.0,
+        help="Une bande hors du panel est du fond si son écart-type temporel médian dépasse ce "
+        "multiple de celui des zones plates du panel.",
+    )
+    background_min_std: float = param(
+        0.8,
+        minimum=0.0,
+        maximum=255.0,
+        help="Écart-type temporel médian minimal (niveaux de gris) d'une bande de fond.",
+    )
+    closing_px: int = param(
+        15, minimum=0, maximum=500, help="Fermeture morphologique des preuves de panel (px réduits)."
+    )
+    temporal_smoothing: float = param(
+        0.6,
+        minimum=0.0,
+        maximum=1.0,
+        help="Segmenteur image par image : poids du rectangle précédent dans le lissage temporel.",
+    )
+    max_rect_jump: float = param(
+        0.25,
+        minimum=0.0,
+        maximum=10.0,
+        help="Segmenteur image par image : saut relatif maximal du rectangle d'une frame à l'autre.",
+    )
+
+
+@dataclass
 class MosaicConfig:
     """Canevas canonique, warp et fusion des observations."""
 
@@ -323,6 +450,8 @@ class PipelineConfig:
     preprocess: PreprocessConfig = field(default_factory=PreprocessConfig)
     motion: MotionConfig = field(default_factory=MotionConfig)
     registration: RegistrationConfig = field(default_factory=RegistrationConfig)
+    scenes: SceneConfig = field(default_factory=SceneConfig)
+    segmentation: SegmentationConfig = field(default_factory=SegmentationConfig)
     mosaic: MosaicConfig = field(default_factory=MosaicConfig)
     export: ExportConfig = field(default_factory=ExportConfig)
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
@@ -356,6 +485,8 @@ class PipelineConfig:
                     f"preprocess.exclusion_zones[{i}] : il faut x0 < x1 et y0 < y1, reçu {zone}"
                 )
 
+        if self.segmentation.sharpness_window % 2 == 0:
+            raise ConfigError("segmentation.sharpness_window doit être impair")
         if self.motion.ecc_gauss_filter_size % 2 == 0:
             raise ConfigError("motion.ecc_gauss_filter_size doit être impair")
 

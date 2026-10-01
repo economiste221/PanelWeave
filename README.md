@@ -18,7 +18,7 @@ vidéo → séquences → segmentation panel/fond → mouvement inter-frames →
 | 2 | Générateur synthétique avec vérité terrain, métriques d'évaluation, reconstruction oracle | ✅ |
 | 3 | Mouvement (SIFT/ORB + RANSAC + ECC, replis flot dense et corrélation log-polaire), chaînage | ✅ |
 | 4 | Mosaïque, fusion médiane pondérée par tuiles, couverture, recadrage, export, pipeline | ✅ |
-| 5 | Segmentation classique, découpage en séquences | à faire |
+| 5 | Découpage en séquences (coupes, fondus), segmentation panel/fond | ✅ |
 | 6 | Recalage sur mosaïque, ajustement global | à faire |
 | 7 | Contrôle qualité, rapport | à faire |
 | 8 | Interface PyQt5 | à faire |
@@ -67,15 +67,18 @@ python -m panelrecon.cli --input ~/Videos/manhwa --output ~/Videos/sortie --conf
 python -m panelrecon.cli --mode inventory --input ~/Videos/manhwa --output ~/Videos/sortie
 ```
 
-Le mode `reconstruct` produit, pour chaque vidéo, dans `<sortie>/<vidéo>/` :
+Le mode `reconstruct` découpe chaque vidéo en séquences (un panel par séquence) et produit, dans
+`<sortie>/<vidéo>/`, pour chaque séquence `k` :
 
-* `<vidéo>_seq000_<début>-<fin>.png` : panel reconstruit, PNG RGBA ; les pixels jamais observés
-  sont transparents (alpha = 0), aucun contenu n'est inventé ;
+* `<vidéo>_seq<k>_<début>-<fin>.png` : panel reconstruit, PNG RGBA, limité à l'emprise du panel
+  (le fond est exclu) ; les pixels jamais observés sont transparents (alpha = 0), aucun contenu
+  n'est inventé ;
 * `…_coverage.png` (16 bits, nombre d'observations par pixel) et `…_coverage_color.png` ;
 * `…json` : séquence, taille, échelle canonique, recadrage, statistiques de couverture, recalage
-  (transformations, estimations, rejets).
+  (transformations, estimations), segmentation (rectangle du panel dans le repère canonique).
 
-`batch_report.json` résume le lot ; une vidéo en échec est rapportée avec sa trace sans arrêter
+`<vidéo>_sequences.json` liste les séquences et les transitions (coupe, fondu, perturbation
+réunie) avec les frames écartées et leurs raisons. `batch_report.json` résume le lot ; une vidéo en échec est rapportée avec sa trace sans arrêter
 les suivantes.
 
 Le mode `inventory` écrit `inventory.json` (métadonnées, frames décodées/conservées, erreurs de
@@ -83,6 +86,45 @@ décodage, intervalles min/médian/max, détection de fréquence variable) et `p
 Une vidéo illisible est journalisée avec sa trace sans interrompre le lot.
 Codes de sortie : `0` succès, `1` au moins une vidéo en échec, `2` erreur d'usage/configuration,
 `130` interruption.
+
+## Découpage en séquences et segmentation (phase 5)
+
+**Découpage** (`core/scene_split.py`, en flux, recalage effectué au passage). Une paire de frames
+consécutives est *en changement* si : la corrélation des histogrammes HSV chute
+(`scenes.histogram_min_correlation`), le mouvement est rejeté (effondrement des inliers, incohérence
+structurelle), le score de cohérence entre la frame et celle située `dissolve_lag` frames avant
+(recalées) chute (changement progressif), ou PySceneDetect signale une coupure non contredite par un
+recalage de forte cohérence (le ContentDetector réagit aussi aux déplacements rapides d'un même
+panel). Une suite de paires en changement forme une transition : ses frames **intérieures** (mélanges
+d'un fondu) sont écartées ; une transition d'une seule paire est une coupe franche ; si la frame qui
+suit se recale sur le panel d'avant (frame parasite, flash), les deux morceaux sont réunis.
+
+Résultats : fondu de 6 frames → séquences 0–19 et 26–45, les 6 frames de mélange écartées
+exactement ; coupe franche → 0–19 et 20–39 ; aucun faux découpage sur les 10 scénarios à panel unique
+(dont déplacement rapide, aplats, fréquence variable, frames dupliquées).
+
+**Segmentation** (`core/segmentation.py`). Le panel étant rigide et recalé, son emprise dans le
+repère canonique est un rectangle fixe, estimé une fois par séquence en cumulant toutes les frames
+(canevas d'analyse à l'échelle réduite) :
+
+1. rectangle initial = boîte de la plus grande composante des points régulièrement **nets**
+   (variance locale du Laplacien ; le fond est un agrandissement flou) ;
+2. chaque côté est étendu jusqu'à la limite observée (panel plus grand que l'écran, zones en aplats
+   sans détail), **sauf** s'il porte une bordure (ligne nette continue : limite panel/fond) ou si la
+   bande au-delà se comporte comme du fond (variation temporelle nettement supérieure à celle des
+   zones plates du panel quand le cadrage bouge) ;
+3. chaque côté délimitant est recalé sur le maximum de gradient de l'image moyenne (la preuve de
+   netteté déborde d'une demi-fenêtre) ;
+4. le rectangle est projeté dans chaque frame : masques cohérents dans le temps par construction.
+
+Le canevas de la mosaïque est restreint à cette emprise. Le segmenteur image par image demandé
+(`ClassicSegmenter`, interface `PanelSegmenter` : netteté, cohérence de mouvement, morphologie,
+`minAreaRect`, lissage temporel) est fourni pour l'usage sans recalage (prévisualisation, SAM 2 en
+phase 9 derrière la même interface).
+
+Résultats **sans aucun masque de vérité terrain** (découpage + recalage + segmentation + fusion) :
+SSIM 0,966 à 0,997 selon le scénario, couverture réelle ≥ 0,991, **aucun pixel de fond** compté
+comme couvert (contre 14 % à 41 % de surestimation sans segmentation en phase 4).
 
 ## Mosaïque et fusion (phase 4)
 
@@ -238,6 +280,12 @@ ses choix et un texte d'aide (réutilisés par l'interface en phase 8). Sections
   maximale, exigence pour les replis), score de cohérence minimal et taille des tuiles,
   recouvrement minimal, replis (flot, corrélation de phase) et leurs seuils ;
 * `registration` : nombre d'échecs consécutifs tolérés ;
+* `scenes` : PySceneDetect (activation, seuil), vignettes, corrélation d'histogramme minimale,
+  écart et seuil du contrôle de changement progressif, seuil de réunion d'une perturbation,
+  longueur maximale d'une transition, longueur minimale d'une séquence ;
+* `segmentation` : méthode (`classic` / `none`), fenêtre et seuils de netteté, fraction minimale de
+  netteté, déplacement minimal, bande et fraction d'une bordure, critères de fond (ratio et minimum
+  d'écart-type temporel), fermeture morphologique, paramètres du segmenteur image par image ;
 * `mosaic` : interpolation, taille maximale du canevas, bande de bord d'écran, érosion du masque,
   rampe et poids minimal de bord, puissance du poids d'échelle, taille des tuiles, couverture
   minimale, mode de recadrage, seuil de pile sur disque et dossier temporaire ;
@@ -251,9 +299,9 @@ compatibilité des profils).
 ## Validation
 
 ```bash
-python -m pytest            # 209 tests (~6 min) : config, modèles, video_io, matériel, CLI,
+python -m pytest            # tests (~10 min) : config, modèles, video_io, matériel, CLI,
                             # générateur synthétique, évaluation, oracle, mouvement, recalage,
-                            # mosaïque, export, pipeline
+                            # mosaïque, export, pipeline, découpage, segmentation
 python -m mypy              # mode strict sur tout le paquet
 ```
 
@@ -275,14 +323,17 @@ panelrecon/
     evaluation.py       # erreurs de pose (jauge), SSIM masqué, couverture, oracle
     motion.py           # estimation de similarité inter-frames (cascade + ECC + validation)
     registration.py     # recalage par chaînage, repère canonique
+    scene_split.py      # découpage en séquences (coupes, fondus, perturbations) + recalage
+    segmentation.py     # netteté, segmenteur image par image, emprise du panel par séquence
     mosaic.py           # canevas, warp + masques de validité, médiane pondérée par tuiles
     export.py           # PNG RGBA, couverture, rapport JSON
-    pipeline.py         # orchestration d'une vidéo (progression, annulation, erreurs capturées)
+    pipeline.py         # orchestration : 3 passes de décodage (découpage, segmentation, fusion)
   tests/
     conftest.py, videofactory.py
     test_config.py, test_models.py, test_video_io.py, test_hardware.py,
     test_cli.py, test_architecture.py, test_synthetic.py, test_evaluation.py,
-    test_motion.py, test_registration.py, test_mosaic.py, test_pipeline.py
+    test_motion.py, test_registration.py, test_mosaic.py, test_pipeline.py,
+    test_scene_split.py, test_segmentation.py
 ```
 
 Modules ajoutés à l'arborescence initiale :
@@ -330,23 +381,29 @@ Modules ajoutés à l'arborescence initiale :
 9. **Frames manquantes** dans un flux endommagé : pas de trou dans les indices, mais `time_s` reste
    exact (testé sur un fichier tronqué).
 
-## Limites connues (phase 4)
+## Limites connues (phase 5)
 
-* **Sans segmentation (phase 5)**, tout le contenu de l'écran est fusionné : quand le fond flou est
-  visible, il est reconstruit autour du panel et compté comme couvert (surestimation de couverture
-  de 14 % sur `zoom_in`, 41 % sur `static`). Les tests de référence de la fusion utilisent donc les
-  masques exacts ; sans masque, ils passent lorsque le panel remplit l'écran.
-* **Une vidéo = une séquence** jusqu'à la phase 5. Un changement de panel par coupe franche
-  interrompt le recalage (seul le premier panel est exporté, avec un avertissement) ; un **fondu
-  enchaîné** est en revanche franchi par le chaînage et les deux panels sont fusionnés : le
-  découpage en séquences (phase 5) est indispensable sur de telles vidéos.
-* Un sous-titre fixe laisse une trace faible là où le panel n'est vu que par peu de frames
-  couvertes par le texte ; la détection automatique des éléments fixes est prévue avec la
-  segmentation (phase 5). La zone d'exclusion configurable règle le cas dès maintenant.
-* Le canevas est dimensionné sur l'emprise des frames entières (les masques ne sont connus qu'au
-  parcours) : la pile d'observations est donc plus grande que nécessaire quand le panel n'occupe
-  qu'une partie de l'écran ; le recadrage final n'en dépend pas.
-* Aucun inpainting : les trous restent transparents (option explicite éventuelle en phase 7).
+Les problèmes signalés en phase 4 sont résolus : le fond n'est plus fusionné (segmentation), une
+vidéo est découpée en autant de séquences que de panels (coupes franches et fondus), et le canevas
+est limité à l'emprise du panel. Limites restantes :
+
+* **Sous-titres** : les vidéos cibles n'en contiennent pas ; aucune détection automatique d'éléments
+  incrustés n'est donc faite. Les zones d'exclusion configurables restent disponibles (vides par
+  défaut).
+* **Panel rectangulaire et aligné** : l'emprise est un rectangle aligné sur les axes du repère
+  canonique (rotation attendue ≈ 0). Un panel non rectangulaire (bulle débordante, découpe
+  irrégulière) est approché par son rectangle englobant ; les zones de fond incluses sont alors
+  fusionnées (et rejetées par la médiane là où le fond bouge relativement au panel).
+* **Bord de panel sans contraste** : un côté sans bordure nette, dont le fond adjacent ne bouge pas
+  par rapport à l'écran et ne varie pas (séquence statique ou fond uni), ne peut pas être distingué
+  d'un aplat du panel ; il est alors étendu à la limite observée.
+* **Fondu sans changement d'histogramme** (deux panels aux palettes identiques) : détecté par le
+  contrôle à décalage, avec un retard ; les 1 à 2 premières frames de mélange peuvent rester dans
+  la séquence précédente (leur faible contamination est atténuée par la médiane).
+* **Trois passes de décodage** : le décodage est peu coûteux devant l'estimation du mouvement, mais
+  le temps de traitement inclut trois lectures de la vidéo.
+* Dérive du chaînage (≤ 0,8 px aux coins sur 30 frames peu texturées) : recalage sur mosaïque et
+  ajustement global en phase 6.
 
 ## Limites connues (phase 3)
 

@@ -175,13 +175,15 @@ def test_cli_register_mode(synthetic: SyntheticCache, tmp_path: Path) -> None:
     out = tmp_path / "out"
     assert cli.main(["--mode", "register", "-i", str(gt.video_path), "-o", str(out)]) == 0
     report = json.loads((out / "pan_horizontal_registration.json").read_text(encoding="utf-8"))
-    assert len(report["transforms"]) == len(gt.frames) and not report["interrupted"]
-    assert len(report["estimates"]) == len(gt.frames) - 1
-    assert report["estimates"][0]["method"] == "sift"
-    # Une vidéo à deux panels (sans découpage) est signalée en échec, sans planter.
+    (sequence,) = report["sequences"]
+    assert len(sequence["transforms"]) == len(gt.frames)
+    assert len(sequence["estimates"]) == len(gt.frames) - 1
+    assert sequence["estimates"][0]["method"] == "sift"
+    # Vidéo à deux panels : deux séquences, la transition est rapportée.
     cf = synthetic.get("crossfade")
-    assert cli.main(["--mode", "register", "-i", str(cf.video_path), "-o", str(out)]) in (0, 1)
-    assert (out / "crossfade_registration.json").is_file()
+    assert cli.main(["--mode", "register", "-i", str(cf.video_path), "-o", str(out)]) == 0
+    report = json.loads((out / "crossfade_registration.json").read_text(encoding="utf-8"))
+    assert len(report["sequences"]) == 2 and report["transitions"][0]["kind"] == "dissolve"
 
 
 def test_registration_result_statistics() -> None:

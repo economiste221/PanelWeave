@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -26,7 +25,6 @@ from panelrecon.core.models import (
 )
 from panelrecon.core.mosaic import build_mosaic
 from panelrecon.core.pipeline import process_video
-from panelrecon.core.synthetic import generate_video, scenario
 from panelrecon.tests.conftest import RegistrationCache, SyntheticCache
 
 
@@ -34,6 +32,19 @@ def _imread(path: Path) -> NDArray[Any]:
     image = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
     assert image is not None, path
     return np.asarray(image)
+
+
+def _result_from_files(image: Path, coverage: Path | None, report: dict[str, Any]) -> MosaicResult:
+    """Reconstitue un MosaicResult à partir des fichiers exportés."""
+    assert coverage is not None
+    transforms = {int(k): v for k, v in report["registration"]["transforms"].items()}
+    return MosaicResult(
+        Sequence(report["sequence"]["start_idx"], report["sequence"]["end_idx"],
+                 tuple(report["sequence"]["excluded"])),
+        _imread(image), _imread(coverage),
+        {i: SimilarityTransform.from_dict(t) for i, t in transforms.items()},
+        CropBox(**report["crop"]), report["canvas_scale"],
+    )
 
 
 def test_sequence_basename() -> None:
@@ -82,17 +93,8 @@ def test_process_video(synthetic: SyntheticCache, tmp_path: Path) -> None:
     assert files.image.parent == tmp_path / "pan_horizontal"
     fractions = [f for f, _ in events]
     assert fractions == sorted(fractions) and fractions[-1] == 1.0
-    # Le panel exporté se compare au panel original (panel plein écran : pas de fond).
-    image = _imread(files.image)
     report = json.loads(files.report.read_text(encoding="utf-8"))
-    transforms = {int(k): v for k, v in report["registration"]["transforms"].items()}
-    assert files.coverage is not None
-    result = MosaicResult(
-        Sequence(**{k: v for k, v in report["sequence"].items() if k != "excluded"}),
-        image, _imread(files.coverage),
-        {i: SimilarityTransform.from_dict(t) for i, t in transforms.items()},
-        CropBox(**report["crop"]), report["canvas_scale"],
-    )
+    result = _result_from_files(files.image, files.coverage, report)
     assert evaluate_mosaic(result, gt, 0).check(ReferenceThresholds()) == []
 
 
@@ -109,15 +111,23 @@ def test_process_video_cancellation(synthetic: SyntheticCache, tmp_path: Path) -
         process_video(synthetic.get("short").video_path, tmp_path, PipelineConfig(), cancel=token)
 
 
-def test_process_video_reports_interruption(synthetic: SyntheticCache, tmp_path: Path) -> None:
-    """Changement de panel sans fondu : fusion des seules frames du premier panel."""
-    spec = replace(scenario("crossfade"), name="cut", crossfade_frames=0)
-    gt = generate_video(spec, tmp_path / "cut")
-    cfg = PipelineConfig()
-    cfg.registration.max_consecutive_failures = 2
-    outcome = process_video(gt.video_path, tmp_path / "out", cfg)
-    assert outcome.ok and outcome.sequences[0].warnings
-    assert outcome.sequences[0].sequence.end_idx == gt.shots[0].end_idx
+def test_process_video_splits_panels(synthetic: SyntheticCache, tmp_path: Path) -> None:
+    """Vidéo à deux panels séparés par un fondu : deux séquences, deux PNG conformes,
+    frames de mélange écartées et rapportées."""
+    gt = synthetic.get("crossfade")
+    outcome = process_video(gt.video_path, tmp_path, PipelineConfig())
+    assert outcome.ok and len(outcome.sequences) == 2
+    assert outcome.split is not None
+    (transition,) = outcome.split.transitions
+    assert transition.kind == "dissolve" and len(transition.excluded) == 6
+    for k, seq in enumerate(outcome.sequences):
+        assert seq.files is not None
+        report = json.loads(seq.files.report.read_text(encoding="utf-8"))
+        assert report["segmentation"]["segmented"]
+        result = _result_from_files(seq.files.image, seq.files.coverage, report)
+        assert evaluate_mosaic(result, gt, k).check(ReferenceThresholds()) == []
+    summary = json.loads((tmp_path / "crossfade" / "crossfade_sequences.json").read_text())
+    assert len(summary["sequences"]) == 2 and summary["transitions"][0]["kind"] == "dissolve"
 
 
 def test_cli_reconstruct(synthetic: SyntheticCache, corrupt_mp4: Path, tmp_path: Path) -> None:

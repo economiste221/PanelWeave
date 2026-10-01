@@ -137,14 +137,24 @@ def plan_canvas(
     transforms: dict[int, SimilarityTransform],
     regions: dict[int, NDArray[np.float64]],
     max_megapixels: float,
+    clip: tuple[float, float, float, float] | None = None,
 ) -> Canvas:
-    """Canevas englobant les régions (coins en coordonnées natives) de chaque frame."""
+    """Canevas englobant les régions (coins en coordonnées natives) de chaque frame,
+    éventuellement restreint à ``clip`` = ``(x0, y0, x1, y1)`` dans le repère canonique
+    (emprise du panel)."""
     pts = [transforms[i].apply(r) for i, r in regions.items() if len(r)]
     if not pts:
         raise ValueError("Aucune région valide à placer dans le canevas")
     allpts = np.vstack(pts)
-    x_min, y_min = np.floor(allpts.min(axis=0)) - 1.0
-    x_max, y_max = np.ceil(allpts.max(axis=0)) + 1.0
+    lo = allpts.min(axis=0)
+    hi = allpts.max(axis=0)
+    if clip is not None:
+        lo = np.maximum(lo, np.array(clip[:2]))
+        hi = np.minimum(hi, np.array(clip[2:]))
+        if np.any(hi <= lo):
+            raise ValueError("L'emprise du panel ne recoupe aucune frame")
+    x_min, y_min = np.floor(lo) - 1.0
+    x_max, y_max = np.ceil(hi) + 1.0
     width, height = int(x_max - x_min) + 1, int(y_max - y_min) + 1
     megapixels = width * height / 1e6
     if megapixels > max_megapixels:
@@ -261,11 +271,13 @@ def build_mosaic(
     panel_masks: PanelMaskProvider | None = None,
     cancel: CancellationToken | None = None,
     progress: ProgressCallback | None = None,
+    clip: tuple[float, float, float, float] | None = None,
 ) -> MosaicResult:
     """Fusionne les frames recalées d'une séquence.
 
     ``frames`` est parcouru une fois (flux) ; seules les frames présentes dans
-    ``registration.transforms`` sont utilisées.
+    ``registration.transforms`` sont utilisées. ``clip`` (repère canonique)
+    restreint le canevas à l'emprise connue du panel.
     """
     cfg = config.mosaic
     transforms = registration.transforms
@@ -273,12 +285,9 @@ def build_mosaic(
         raise ValueError("Aucune frame recalée")
     interpolation = _INTERPOLATIONS[cfg.interpolation]
 
-    # Les masques sont nécessaires pour dimensionner le canevas : sans segmentation
-    # (ou si elle ne dépend que de la frame), ils sont calculés frame par frame lors
-    # du parcours ; on dimensionne donc sur l'emprise maximale (frame entière) puis
-    # on recadre à la fin sur la couverture réelle.
+    # Canevas : emprise des frames, restreinte à celle du panel quand elle est connue.
     regions = {i: corners(*registration.frame_sizes[i]) for i in transforms}
-    canonical = plan_canvas(transforms, regions, cfg.max_canvas_megapixels)
+    canonical = plan_canvas(transforms, regions, cfg.max_canvas_megapixels, clip)
     to_canvas = {i: canonical.offset @ t for i, t in transforms.items()}
     order = sorted(transforms)
     slot = {idx: k for k, idx in enumerate(order)}

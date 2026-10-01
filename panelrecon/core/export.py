@@ -100,6 +100,7 @@ def mosaic_report(
     config: PipelineConfig,
     video: VideoInfo | None = None,
     files: ExportedFiles | None = None,
+    extra: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     report: dict[str, Any] = {
         "report_version": REPORT_VERSION,
@@ -129,6 +130,8 @@ def mosaic_report(
         report["registration"]["estimates"] = [e.to_dict() for e in registration.estimates]
     if files is not None:
         report["files"] = files.to_dict()
+    if extra:
+        report.update(extra)
     return report
 
 
@@ -139,6 +142,7 @@ def export_sequence(
     basename: str,
     config: PipelineConfig,
     video: VideoInfo | None = None,
+    extra: dict[str, Any] | None = None,
 ) -> ExportedFiles:
     """Écrit le panel, la couverture et le rapport d'une séquence."""
     compression = config.export.png_compression
@@ -149,6 +153,6 @@ def export_sequence(
         coverage_color = write_png(out_dir / f"{basename}_coverage_color.png",
                                    coverage_colormap(result.coverage), compression)
     files = ExportedFiles(image, out_dir / f"{basename}.json", coverage, coverage_color)
-    write_json(files.report, mosaic_report(result, registration, config, video, files))
+    write_json(files.report, mosaic_report(result, registration, config, video, files, extra))
     logger.info("Exporté : %s", image)
     return files
