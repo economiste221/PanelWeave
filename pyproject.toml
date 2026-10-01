@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "panelrecon"
+version = "0.1.0"
+description = "Reconstruction automatique de panels de manhwa/webtoon à partir de vidéos animées."
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+license = { text = "Proprietary" }
+dependencies = [
+    "numpy>=2.0",
+    "opencv-python-headless>=4.5",
+    "av>=12",
+    "scenedetect[opencv-headless]>=0.6.4,<0.7",
+    "scikit-image>=0.22",
+    "scipy>=1.11",
+    "PyQt5>=5.15",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-qt>=4.4", "mypy>=1.10"]
+
+[project.scripts]
+panelrecon = "panelrecon.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["panelrecon*"]
+
+[tool.pytest.ini_options]
+testpaths = ["panelrecon/tests"]
+addopts = "-ra"
+log_level = "INFO"
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_unreachable = true
+files = ["panelrecon"]
+
+[[tool.mypy.overrides]]
+module = ["scenedetect.*", "skimage.*", "scipy.*"]
+ignore_missing_imports = true
