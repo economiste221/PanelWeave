@@ -67,10 +67,12 @@ class VideoIOConfig:
         1, minimum=1, maximum=1000, help="Ne garder qu'une frame décodée sur N."
     )
     max_fps: float = param(
-        0.0,
+        30.0,
         minimum=0.0,
         maximum=1000.0,
-        help="Cadence maximale conservée, appliquée sur les timestamps (0 = pas de limite).",
+        help="Cadence maximale conservée, appliquée sur les timestamps (0 = pas de limite). "
+        "30 i/s suffisent : au-delà, les frames consécutives d'un panel animé sont quasi "
+        "identiques.",
     )
     decode_threads: int = param(
         0, minimum=0, maximum=64, help="Threads de décodage FFmpeg (0 = automatique)."
@@ -394,6 +396,17 @@ class MosaicConfig:
         help="Poids ∝ (1 / échelle frame→canevas)^p : favorise les frames les plus zoomées.",
     )
     tile_size: int = param(256, minimum=16, maximum=8192, help="Côté des tuiles de fusion (px).")
+    max_observations: int = param(
+        24,
+        minimum=0,
+        maximum=100000,
+        help="Observations visées par zone du canevas : au-delà, les frames redondantes ne sont "
+        "pas fusionnées (0 = toutes). Les plus zoomées sont prioritaires, puis réparties dans le "
+        "temps ; chaque zone observée reste couverte.",
+    )
+    selection_cell_px: int = param(
+        32, minimum=4, maximum=4096, help="Taille des zones (px du canevas) de la sélection."
+    )
     min_coverage: int = param(
         1, minimum=1, maximum=100000, help="Observations minimales pour qu'un pixel soit opaque."
     )

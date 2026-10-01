@@ -22,6 +22,7 @@ VFR_TIMES = [round(sum((0.02, 0.1, 0.04)[k % 3] for k in range(i)), 3) for i in 
 def small_config() -> PipelineConfig:
     config = PipelineConfig()
     config.preprocess.motion_long_side = 160
+    config.video.max_fps = 0.0  # lecture brute : toutes les frames
     return config
 
 

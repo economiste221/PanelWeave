@@ -52,6 +52,8 @@ logger = logging.getLogger(__name__)
 
 _INTERPOLATIONS: Final[dict[str, int]] = {"lanczos4": cv2.INTER_LANCZOS4, "cubic": cv2.INTER_CUBIC}
 _EDGE_LEVELS: Final[float] = 254.0  # poids de bord quantifié sur 1..255
+# Part minimale des zones d'une frame encore sous l'objectif d'observations pour la retenir.
+_SELECTION_MIN_GAIN: Final[float] = 0.25
 ProgressCallback = Callable[[float, str], None]
 
 
@@ -288,8 +290,15 @@ def build_mosaic(
     # Canevas : emprise des frames, restreinte à celle du panel quand elle est connue.
     regions = {i: corners(*registration.frame_sizes[i]) for i in transforms}
     canonical = plan_canvas(transforms, regions, cfg.max_canvas_megapixels, clip)
-    to_canvas = {i: canonical.offset @ t for i, t in transforms.items()}
-    order = sorted(transforms)
+    all_to_canvas = {i: canonical.offset @ t for i, t in transforms.items()}
+    chosen = select_observations(all_to_canvas, registration.frame_sizes, canonical,
+                                 cfg.max_observations, cfg.selection_cell_px,
+                                 cfg.scale_weight_power)
+    to_canvas = {i: all_to_canvas[i] for i in chosen}
+    if len(chosen) < len(transforms):
+        logger.info("Fusion : %d frames retenues sur %d (observations redondantes écartées)",
+                    len(chosen), len(transforms))
+    order = sorted(chosen)
     slot = {idx: k for k, idx in enumerate(order)}
     scale_w = np.array([scale_weight(to_canvas[i], cfg.scale_weight_power) for i in order],
                        dtype=np.float32)
@@ -324,9 +333,11 @@ def build_mosaic(
     region_cov = covered[sl]
     bgra[..., :3] = np.where(region_cov[..., None], to_u8(np.nan_to_num(fused[sl], nan=0.0)), 0)
     bgra[..., 3] = np.where(region_cov, 255, 0).astype(np.uint8)
+    registered = sorted(transforms)
+    first, last = registered[0], registered[-1]
     result = MosaicResult(
-        sequence=Sequence(order[0], order[-1],
-                          excluded=tuple(i for i in registration.excluded if order[0] <= i <= order[-1])),
+        sequence=Sequence(first, last,
+                          excluded=tuple(i for i in registration.excluded if first <= i <= last)),
         image_bgra=bgra,
         coverage=np.ascontiguousarray(coverage[sl]),
         transforms=to_canvas,
@@ -339,6 +350,64 @@ def build_mosaic(
         float(coverage[sl][region_cov].mean()),
     )
     return result
+
+
+def _radical_inverse(n: int) -> float:
+    """Suite de van der Corput (base 2) : ordre de parcours qui répartit les rangs."""
+    result, base = 0.0, 0.5
+    while n:
+        result += base * (n & 1)
+        n >>= 1
+        base *= 0.5
+    return result
+
+
+def select_observations(
+    to_canvas: dict[int, SimilarityTransform],
+    frame_sizes: dict[int, tuple[int, int]],
+    canvas: Canvas,
+    max_observations: int,
+    cell_px: int,
+    scale_power: float,
+) -> list[int]:
+    """Frames à fusionner : au plus ~``max_observations`` par zone du canevas.
+
+    Les frames sont examinées par poids d'échelle décroissant (les plus zoomées
+    d'abord), puis dans un ordre temporel réparti (van der Corput) ; une frame est
+    retenue si au moins un quart de ses zones ont moins de ``max_observations``
+    observations ou, en premier lieu, à une zone encore jamais observée
+    (toute zone couverte par une frame reste donc couverte). Une frame qui
+    n'apporte qu'à une petite part de ses zones est écartée pour limiter la
+    redondance.
+    """
+    indices = sorted(to_canvas)
+    if max_observations <= 0 or len(indices) <= max_observations:
+        return indices
+    grid_w = max(1, math.ceil(canvas.width / cell_px))
+    grid_h = max(1, math.ceil(canvas.height / cell_px))
+    counts = np.zeros((grid_h, grid_w), dtype=np.int32)
+    rank = {idx: k for k, idx in enumerate(indices)}
+
+    def key(idx: int) -> tuple[float, float]:
+        weight = scale_weight(to_canvas[idx], scale_power)
+        return (-round(weight, 3), _radical_inverse(rank[idx]))
+
+    to_grid = SimilarityTransform(scale=1.0 / cell_px)
+    chosen: list[int] = []
+    for idx in sorted(indices, key=key):
+        quad = (to_grid @ to_canvas[idx]).apply(corners(*frame_sizes[idx]))
+        footprint = np.zeros((grid_h, grid_w), dtype=np.uint8)
+        cv2.fillConvexPoly(footprint, np.rint(quad * 16).astype(np.int32), 1, shift=4)
+        cells = footprint > 0
+        if not cells.any():
+            continue
+        local = counts[cells]
+        # Toujours retenue si elle couvre une zone jamais observée (couverture garantie) ;
+        # sinon, seulement si une part notable de ses zones manque encore d'observations.
+        if (local == 0).any() or (local < max_observations).mean() >= _SELECTION_MIN_GAIN:
+            counts[cells] += 1
+            chosen.append(idx)
+    return sorted(chosen)
 
 
 def _warp_observation(

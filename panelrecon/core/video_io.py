@@ -36,6 +36,8 @@ from panelrecon.core.models import (
 logger = logging.getLogger(__name__)
 
 BACKEND_PYAV = "pyav"
+# Fraction de période tolérée sur les timestamps pour le plafonnement de cadence.
+_BUCKET_TOLERANCE = 0.1
 BACKEND_OPENCV = "opencv"
 
 
@@ -450,8 +452,8 @@ class VideoReader:
         self.decode_errors = 0
         self.frames_decoded = 0
         step = self._video_cfg.frame_step
-        min_dt = 1.0 / self._video_cfg.max_fps if self._video_cfg.max_fps > 0 else 0.0
-        last_kept_time: float | None = None
+        max_fps = self._video_cfg.max_fps
+        last_bucket: int | None = None
         fps = backend.info.fps if backend.info.fps > 0 else 0.0
         try:
             for index, raw in enumerate(backend.iter_raw()):
@@ -466,11 +468,13 @@ class VideoReader:
                 time_s = raw.time_s
                 if time_s is None:
                     time_s = index / fps if fps > 0 else float(index)
-                if min_dt > 0.0 and last_kept_time is not None:
-                    # Tolérance d'un millième de période pour absorber l'arrondi des pts.
-                    if time_s - last_kept_time < min_dt * (1.0 - 1e-3):
+                if max_fps > 0.0:
+                    # Au plus une frame par créneau de 1/max_fps s. La tolérance absorbe
+                    # l'arrondi des pts (ex. intervalles de 16/17 ms à 60 i/s).
+                    bucket = math.floor(time_s * max_fps + _BUCKET_TOLERANCE)
+                    if last_bucket is not None and bucket <= last_bucket:
                         continue
-                last_kept_time = time_s
+                    last_bucket = bucket
                 image = self._apply_rotation(raw.image, raw.rotation_deg)
                 yield self._make_obs(index, time_s, raw.pts, image, compute_proxy)
         finally:

@@ -21,6 +21,7 @@ from panelrecon.core.mosaic import (
     edge_weight,
     plan_canvas,
     scale_weight,
+    select_observations,
     validity_mask,
     weighted_median,
 )
@@ -239,3 +240,31 @@ def test_errors(registered: RegistrationCache) -> None:
         build_mosaic(iter(()), registration, PipelineConfig())
     with pytest.raises(ValueError):
         build_mosaic(iter(()), replace(registration, transforms={}), PipelineConfig())
+
+
+def test_select_observations_keeps_coverage() -> None:
+    """60 frames qui défilent : la sélection borne les observations par zone sans
+    laisser de zone non couverte, et préfère les frames les plus zoomées."""
+    canvas = plan_canvas({0: SimilarityTransform()}, {0: np.array([[0.0, 0.0], [999.0, 299.0]])},
+                         10.0)
+    transforms = {i: SimilarityTransform.from_translation(10.0 * i, 0.0) for i in range(60)}
+    transforms[30] = SimilarityTransform(0.8, 0.0, 300.0, 0.0)  # frame la plus zoomée
+    sizes = {i: (400, 300) for i in transforms}
+    chosen = select_observations(transforms, sizes, canvas, 4, 16, 2.0)
+    assert 30 in chosen and len(chosen) < 30
+
+    def coverage(indices: list[int]) -> NDArray[np.int32]:
+        cov = np.zeros((canvas.height, canvas.width), np.int32)
+        for i in indices:
+            x0 = int(max(0, transforms[i].tx + canvas.offset.tx))
+            x1 = int(min(canvas.width, x0 + 400 * transforms[i].scale))
+            cov[:, x0:x1] += 1
+        return cov
+
+    full, kept = coverage(sorted(transforms)), coverage(chosen)
+    assert np.array_equal(full > 0, kept > 0)
+    # Borne indicative (~K) : une frame retenue pour une zone en manque compte aussi
+    # pour ses autres zones, d'où un dépassement local, mais la réduction est forte.
+    assert np.median(kept[kept > 0]) <= 2 * 4
+    assert kept.max() <= full.max() // 2
+    assert select_observations(transforms, sizes, canvas, 0, 16, 2.0) == sorted(transforms)
