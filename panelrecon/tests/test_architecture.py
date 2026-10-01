@@ -11,6 +11,8 @@ CORE_MODULES = (
     "panelrecon.core.geometry",
     "panelrecon.core.synthetic",
     "panelrecon.core.evaluation",
+    "panelrecon.core.motion",
+    "panelrecon.core.registration",
     "panelrecon.cli",
     "panelrecon.synth_cli",
 )

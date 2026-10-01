@@ -5,12 +5,17 @@ Usage ::
     python -m panelrecon.cli --input DOSSIER_OU_FICHIER [...] --output DOSSIER [--config cfg.json]
     python -m panelrecon.cli --write-default-config cfg.json
 
-Mode disponible à ce stade :
+Modes disponibles à ce stade :
 
 * ``inventory`` : découvre les vidéos, les décode intégralement en flux et écrit
   ``inventory.json`` (métadonnées, nombre de frames, statistiques des
   intervalles de temps pour détecter la fréquence variable, erreurs). Une vidéo
   illisible est journalisée avec sa trace et n'interrompt pas le lot.
+
+* ``register`` : recale chaque vidéo (traitée comme une séquence unique, le
+  découpage en séquences arrivant en phase 5) et écrit
+  ``<vidéo>_registration.json`` : transformations frame → repère canonique,
+  estimations acceptées et rejetées.
 
 Codes de sortie : 0 = succès, 1 = au moins une vidéo en échec,
 2 = erreur d'usage ou de configuration, 130 = interruption.
@@ -34,6 +39,7 @@ from panelrecon import __version__
 from panelrecon.core.config import ConfigError, PipelineConfig
 from panelrecon.core.hardware import resolve_num_workers, select_torch_device
 from panelrecon.core.models import CancellationToken, OperationCancelled
+from panelrecon.core.registration import RegistrationResult, register_frames
 from panelrecon.core.video_io import VideoError, VideoReader, discover_videos
 
 logger = logging.getLogger("panelrecon.cli")
@@ -79,7 +85,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", "-c", type=Path, help="Fichier de configuration JSON.")
     parser.add_argument(
         "--mode",
-        choices=("inventory",),
+        choices=("inventory", "register"),
         default="inventory",
         help="Traitement à exécuter (défaut : inventory).",
     )
@@ -211,6 +217,63 @@ def run_inventory(
     return results
 
 
+def registration_report(result: RegistrationResult, info: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "panelrecon_version": __version__,
+        "video": info,
+        "reference_index": result.reference_index,
+        "canonical_scale": result.canonical_scale,
+        "interrupted": result.interrupted,
+        "interruption_reason": result.interruption_reason,
+        "mean_inlier_ratio": result.mean_inlier_ratio,
+        "min_inlier_ratio": result.min_inlier_ratio,
+        "rms_reprojection_error": result.rms_reprojection_error,
+        "excluded": result.excluded,
+        "transforms": {str(i): t.to_dict() for i, t in sorted(result.transforms.items())},
+        "estimates": [e.to_dict() for e in result.estimates],
+        "rejected": [e.to_dict() for e in result.rejected],
+    }
+
+
+def run_register(
+    inputs: Sequence[Path],
+    output_dir: Path,
+    config: PipelineConfig,
+    cancel: CancellationToken | None = None,
+) -> list[VideoInventory]:
+    """Recale chaque vidéo comme une séquence unique ; une erreur n'arrête pas le lot."""
+    videos = discover_videos(inputs, config.video.extensions, config.video.recursive)
+    logger.info("%d vidéo(s) trouvée(s)", len(videos))
+    output_dir.mkdir(parents=True, exist_ok=True)
+    results: list[VideoInventory] = []
+    for n, path in enumerate(videos, start=1):
+        logger.info("[%d/%d] %s", n, len(videos), path)
+        start = time.perf_counter()
+        entry = VideoInventory(path=path, status="ok")
+        try:
+            with VideoReader(path, config.video, config.preprocess, cancel=cancel) as reader:
+                entry.info = reader.info.to_dict()
+                result = register_frames(reader.frames(), config, cancel=cancel)
+                entry.frames_decoded = reader.frames_decoded
+                entry.decode_errors = reader.decode_errors
+            entry.frames_kept = len(result.transforms)
+            report = registration_report(result, entry.info)
+            out = output_dir / f"{path.stem}_registration.json"
+            out.write_text(json.dumps(report, indent=1, ensure_ascii=False) + "\n", encoding="utf-8")
+            if result.interrupted:
+                entry.status = "error"
+                entry.error = f"Recalage interrompu : {result.interruption_reason}"
+        except OperationCancelled:
+            raise
+        except (VideoError, OSError, ValueError) as exc:
+            entry.status = "error"
+            entry.error = f"{type(exc).__name__}: {exc}"
+            logger.exception("Échec du recalage de %s", path)
+        entry.elapsed_s = time.perf_counter() - start
+        results.append(entry)
+    return results
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -248,7 +311,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     cancel = CancellationToken()
     try:
-        results = run_inventory(args.input, output_dir, config, cancel)
+        runner = run_register if args.mode == "register" else run_inventory
+        results = runner(args.input, output_dir, config, cancel)
     except (KeyboardInterrupt, OperationCancelled):
         logger.warning("Traitement interrompu")
         return EXIT_INTERRUPTED

@@ -135,11 +135,16 @@ class SimilarityTransform:
         dst: NDArray[Any],
         weights: NDArray[Any] | None = None,
         allow_rotation: bool = True,
+        rotation_regularization: float = 0.0,
     ) -> SimilarityTransform:
-        """Similarité minimisant ``Σ wᵢ‖T(srcᵢ) − dstᵢ‖²`` (solution fermée d'Umeyama).
+        """Similarité minimisant ``Σ wᵢ‖T(srcᵢ) − dstᵢ‖² + λ·σ²·b²`` (forme fermée d'Umeyama).
 
-        Avec ``allow_rotation=False``, la rotation est fixée à 0 (échelle + translation).
+        ``T`` a pour partie linéaire ``[[a, −b], [b, a]]`` ; ``σ²`` est la variance
+        pondérée des sources. ``λ = rotation_regularization`` pénalise la rotation
+        (``b`` est divisé par ``1 + λ``) ; ``allow_rotation=False`` la fixe à 0.
         """
+        if rotation_regularization < 0:
+            raise ValueError("rotation_regularization doit être ≥ 0")
         p = np.asarray(src, dtype=np.float64)
         q = np.asarray(dst, dtype=np.float64)
         if p.ndim != 2 or p.shape[1] != 2 or p.shape != q.shape:
@@ -161,7 +166,7 @@ class SimilarityTransform:
         sxx = float(w @ (pc[:, 0] * qc[:, 0] + pc[:, 1] * qc[:, 1]))
         sxy = float(w @ (pc[:, 0] * qc[:, 1] - pc[:, 1] * qc[:, 0]))
         if allow_rotation:
-            a, b = sxx / var_p, sxy / var_p
+            a, b = sxx / var_p, sxy / (var_p * (1.0 + rotation_regularization))
         else:
             a, b = sxx / var_p, 0.0
         scale = math.hypot(a, b)
@@ -283,6 +288,7 @@ class MotionEstimate:
     ecc_refined: bool = False
     accepted: bool = True
     reason: str = ""
+    ncc: float | None = None  # corrélation photométrique sur le recouvrement
 
     def __post_init__(self) -> None:
         if self.n_matches < 0 or self.n_inliers < 0 or self.n_inliers > self.n_matches:
@@ -307,6 +313,7 @@ class MotionEstimate:
             "ecc_refined": self.ecc_refined,
             "accepted": self.accepted,
             "reason": self.reason,
+            "ncc": self.ncc,
         }
 
 

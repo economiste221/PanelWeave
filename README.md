@@ -16,7 +16,7 @@ vidéo → séquences → segmentation panel/fond → mouvement inter-frames →
 |---|---|---|
 | 1 | Squelette, configuration, modèles, `video_io`, détection matérielle, CLI (`inventory`) | ✅ |
 | 2 | Générateur synthétique avec vérité terrain, métriques d'évaluation, reconstruction oracle | ✅ |
-| 3 | Mouvement (SIFT + RANSAC + ECC), chaînage | à faire |
+| 3 | Mouvement (SIFT/ORB + RANSAC + ECC, replis flot dense et corrélation log-polaire), chaînage | ✅ |
 | 4 | Mosaïque, fusion médiane, couverture, export | à faire |
 | 5 | Segmentation classique, découpage en séquences | à faire |
 | 6 | Recalage sur mosaïque, ajustement global | à faire |
@@ -69,6 +69,59 @@ décodage, intervalles min/médian/max, détection de fréquence variable) et `p
 Une vidéo illisible est journalisée avec sa trace sans interrompre le lot.
 Codes de sortie : `0` succès, `1` au moins une vidéo en échec, `2` erreur d'usage/configuration,
 `130` interruption.
+
+## Mouvement et recalage (phase 3)
+
+```bash
+# Recale chaque vidéo comme une séquence unique (le découpage en séquences arrive en phase 5)
+python -m panelrecon.cli --mode register -i synth/zoom_in.mp4 -o sortie
+```
+
+Écrit `<vidéo>_registration.json` : transformations `frame → repère canonique`, estimations
+acceptées (méthode, inliers, RMS, score de cohérence) et rejetées avec leur raison.
+
+**Estimation inter-frames** (`core/motion.py`, sur l'image réduite) — cascade, chaque étage n'étant
+tenté que si le précédent est rejeté :
+
+1. SIFT (ou ORB) restreint au masque du panel érodé, sur image à contraste étiré ; seconde détection
+   à seuil de contraste abaissé si la frame est peu texturée ; kNN + ratio de Lowe ; RANSAC
+   (`estimateAffinePartial2D`, graine fixée) ; moindres carrés sur les inliers avec rotation
+   régularisée (Umeyama pondéré, `b / (1 + λ)`), deux passes ;
+2. flot de Farneback (aller et retour) échantillonné sur le point le plus structuré de chaque
+   cellule, vecteurs filtrés par cohérence aller-retour, puis même ajustement robuste ;
+3. corrélation de phase log-polaire (échelle, rotation) sur spectre carré, puis corrélation de phase
+   (translation).
+
+Chaque candidat est raffiné par ECC (`MOTION_AFFINE` reprojeté sur une similarité, correction
+bornée) puis **validé** : bornes de rotation et d'échelle, recouvrement minimal, et score de
+cohérence structurelle = médiane par tuiles de la NCC des normes de gradient. Ce score sépare
+nettement un alignement correct (≥ 0,985 sur tous les scénarios) d'une erreur de 2 px (≤ 0,92), y
+compris sur aplats, et la médiane le rend insensible aux sous-titres fixes. Les replis ne sont
+acceptés que si l'ECC converge. Une paire rejetée est journalisée avec la raison de chaque étage.
+
+**Recalage** (`core/registration.py`) : chaînage sur la dernière frame acceptée ; une frame rejetée
+est exclue et la suivante est estimée par rapport à l'ancre ; au-delà de
+`registration.max_consecutive_failures` échecs consécutifs, la séquence est déclarée interrompue.
+Les transformations sont converties en coordonnées natives (conjugaison par le facteur de proxy) et
+exprimées dans le repère canonique : la frame la plus zoomée est à l'échelle 1.
+
+Résultats sur les vidéos synthétiques encodées (erreurs après ajustement de jauge, toutes frames) :
+
+| Scénario | translation max (px) | coins max (px) | échelle max |
+|---|---|---|---|
+| static | 0,001 | 0,002 | 0,000 % |
+| pan_horizontal | 0,061 | 0,132 | 0,020 % |
+| pan_vertical | 0,193 | 0,238 | 0,029 % |
+| zoom_in / zoom_out | 0,022 / 0,016 | 0,025 / 0,215 | 0,003 / 0,056 % |
+| pan_zoom_eased | 0,081 | 0,191 | 0,037 % |
+| duplicates | 0,049 | 0,069 | 0,008 % |
+| crossfade (2 plans) | 0,047 / 0,012 | 0,062 / 0,043 | 0,008 / 0,009 % |
+| subtitles | 0,247 | 0,761 | 0,159 % |
+| flat_texture | 0,365 | 0,792 | 0,128 % |
+| short / vfr | 0,007 / 0,027 | 0,024 / 0,154 | 0,005 / 0,037 % |
+
+Seuils de la spécification : translation < 1 px, échelle < 0,5 %. La dérive du chaînage est visible
+sur `subtitles` et `flat_texture` (coins à ~0,8 px) : c'est l'objet de la phase 6.
 
 ## Vidéos synthétiques de référence (phase 2)
 
@@ -125,6 +178,12 @@ ses choix et un texte d'aide (réutilisés par l'interface en phase 8). Sections
   threads de décodage, rotation d'affichage, tolérance aux paquets corrompus ;
 * `preprocess` : côté long de la version réduite pour le mouvement (960 px), zones d'exclusion
   relatives (sous-titres, logos) ;
+* `motion` : détecteur, nombre de points, étirement de contraste et détection « peu texturée »,
+  ratio de Lowe, paramètres RANSAC, inliers et taux minimaux, érosion du masque, régularisation et
+  borne de rotation, variation d'échelle maximale, ECC (itérations, epsilon, filtre, correction
+  maximale, exigence pour les replis), score de cohérence minimal et taille des tuiles,
+  recouvrement minimal, replis (flot, corrélation de phase) et leurs seuils ;
+* `registration` : nombre d'échecs consécutifs tolérés ;
 * `runtime` : graine, device (`auto` = CUDA → MPS → CPU), nombre de workers
   (`0` = cœurs performance via `sysctl hw.perflevel0.physicalcpu`), niveau de journalisation.
 
@@ -134,8 +193,8 @@ compatibilité des profils).
 ## Validation
 
 ```bash
-python -m pytest            # 127 tests (~70 s) : config, modèles, video_io, matériel, CLI,
-                            # générateur synthétique, évaluation, oracle de référence
+python -m pytest            # 170 tests (~2 min 30) : config, modèles, video_io, matériel, CLI,
+                            # générateur synthétique, évaluation, oracle, mouvement, recalage
 python -m mypy              # mode strict sur tout le paquet
 ```
 
@@ -155,10 +214,13 @@ panelrecon/
     geometry.py         # warp anti-repliement exact, masques de couverture, coins
     synthetic.py        # générateur de vidéos + vérité terrain, scénarios de référence
     evaluation.py       # erreurs de pose (jauge), SSIM masqué, couverture, oracle
+    motion.py           # estimation de similarité inter-frames (cascade + ECC + validation)
+    registration.py     # recalage par chaînage, repère canonique
   tests/
     conftest.py, videofactory.py
     test_config.py, test_models.py, test_video_io.py, test_hardware.py,
-    test_cli.py, test_architecture.py, test_synthetic.py, test_evaluation.py
+    test_cli.py, test_architecture.py, test_synthetic.py, test_evaluation.py,
+    test_motion.py, test_registration.py
 ```
 
 Modules ajoutés à l'arborescence initiale :
@@ -205,6 +267,20 @@ Modules ajoutés à l'arborescence initiale :
    officiel, chemin des poids configurable).
 9. **Frames manquantes** dans un flux endommagé : pas de trou dans les indices, mais `time_s` reste
    exact (testé sur un fichier tronqué).
+
+## Limites connues (phase 3)
+
+* Sans segmentation (phase 5), l'estimation porte sur toute la frame (hors zones d'exclusion) : le
+  fond flou fournit peu de points et RANSAC les écarte, mais un fond net animé indépendamment
+  biaiserait l'estimation. Le paramètre `panel_masks` de `register_frames` est prêt à recevoir les
+  masques.
+* Chaînage simple : l'erreur s'accumule (jusqu'à ~0,8 px aux coins sur 30 frames peu texturées) ;
+  recalage sur mosaïque et ajustement global en phase 6.
+* Les frames de fondu enchaîné sont acceptées si elles restent proches d'un des deux panels : leur
+  rejet relève du découpage en séquences (phase 5).
+* Coût : ~0,1 s par paire en 640×360 sur un cœur (SIFT + appariement exhaustif + ECC). Les replis
+  (flot aller-retour, corrélation de phase) sont plus coûteux mais rares sur des panels texturés.
+* Le module LoFTR (et RAFT comme flot) de la cascade sera branché en phase 9.
 
 ## Limites connues (phase 2)
 

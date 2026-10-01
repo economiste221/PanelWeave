@@ -106,6 +106,133 @@ class PreprocessConfig:
 
 
 @dataclass
+class MotionConfig:
+    """Estimation de la similarité inter-frames (sur les images réduites)."""
+
+    detector: str = param("sift", choices=("sift", "orb"), help="Détecteur de points d'intérêt.")
+    max_features: int = param(
+        2000, minimum=100, maximum=50000, help="Nombre maximal de points détectés par frame."
+    )
+    contrast_stretch: bool = param(
+        True,
+        help="Étirement de contraste (percentiles 0,5–99,5 %) avant détection et flot : "
+        "indispensable pour les panels en aplats peu contrastés.",
+    )
+    low_texture_min_features: int = param(
+        300,
+        minimum=0,
+        maximum=100000,
+        help="En dessous de ce nombre de points, nouvelle détection avec un seuil de contraste "
+        "SIFT abaissé (panels peu texturés).",
+    )
+    low_texture_contrast_threshold: float = param(
+        0.01, minimum=0.0001, maximum=0.2, help="Seuil de contraste SIFT de la seconde détection."
+    )
+    lowe_ratio: float = param(
+        0.75, minimum=0.3, maximum=0.99, help="Seuil du ratio test de Lowe (kNN, k = 2)."
+    )
+    ransac_reproj_threshold: float = param(
+        2.0, minimum=0.1, maximum=50.0, help="Seuil de reprojection RANSAC (px, image réduite)."
+    )
+    ransac_max_iters: int = param(5000, minimum=10, maximum=1000000, help="Itérations RANSAC.")
+    ransac_confidence: float = param(
+        0.999, minimum=0.5, maximum=0.999999, help="Confiance RANSAC."
+    )
+    min_inliers: int = param(
+        15, minimum=3, maximum=100000, help="Inliers minimum pour accepter une estimation."
+    )
+    min_inlier_ratio: float = param(
+        0.25, minimum=0.0, maximum=1.0, help="Taux d'inliers minimum pour accepter une estimation."
+    )
+    mask_erode_px: int = param(
+        3, minimum=0, maximum=200, help="Érosion du masque de panel avant détection (px réduits)."
+    )
+    rotation_regularization: float = param(
+        10.0,
+        minimum=0.0,
+        maximum=1e6,
+        help="Pénalisation de la rotation dans l'ajustement (0 = libre ; la rotation est réduite "
+        "d'un facteur 1 + valeur).",
+    )
+    max_rotation_deg: float = param(
+        3.0, minimum=0.0, maximum=180.0, help="Rotation inter-frames maximale acceptée (degrés)."
+    )
+    max_scale_change: float = param(
+        1.6, minimum=1.0, maximum=10.0, help="Variation d'échelle inter-frames maximale acceptée."
+    )
+    ecc_enabled: bool = param(True, help="Raffinement sous-pixel par ECC.")
+    ecc_max_iterations: int = param(50, minimum=1, maximum=10000, help="Itérations ECC.")
+    ecc_epsilon: float = param(1e-4, minimum=1e-12, maximum=1e-1, help="Critère d'arrêt ECC.")
+    ecc_gauss_filter_size: int = param(
+        5, minimum=1, maximum=31, help="Taille (impaire) du filtre gaussien de l'ECC."
+    )
+    require_ecc_for_fallbacks: bool = param(
+        True,
+        help="N'accepter une estimation de repli (flot, corrélation de phase) que si l'ECC "
+        "converge à partir d'elle (validation photométrique sous-pixel).",
+    )
+    ecc_max_correction_px: float = param(
+        3.0,
+        minimum=0.0,
+        maximum=100.0,
+        help="Correction ECC maximale (déplacement des coins, px réduits) ; au-delà, rejet de l'ECC.",
+    )
+    min_ncc: float = param(
+        0.92,
+        minimum=-1.0,
+        maximum=1.0,
+        help="Score de cohérence structurelle minimal (médiane, sur des tuiles, de la NCC des "
+        "normes de gradient sur le recouvrement) pour accepter une estimation.",
+    )
+    ncc_tile_px: int = param(
+        80, minimum=8, maximum=4096, help="Taille des tuiles du score de cohérence (px réduits)."
+    )
+    min_overlap_ratio: float = param(
+        0.15,
+        minimum=0.0,
+        maximum=1.0,
+        help="Recouvrement minimal (fraction de la frame cible) pour accepter une estimation.",
+    )
+    fallback_flow: str = param(
+        "farneback", choices=("none", "farneback"), help="Repli par flot optique dense."
+    )
+    flow_grid_step: int = param(
+        8, minimum=1, maximum=256, help="Pas d'échantillonnage du champ de flot (px réduits)."
+    )
+    flow_min_structure: float = param(
+        0.02,
+        minimum=0.0,
+        maximum=1.0,
+        help="Structure locale minimale d'un vecteur de flot (plus petite valeur propre du "
+        "tenseur de structure, relative au maximum) : écarte les zones uniformes.",
+    )
+    flow_max_fb_error: float = param(
+        1.0,
+        minimum=0.01,
+        maximum=50.0,
+        help="Erreur aller-retour maximale d'un vecteur de flot (px réduits).",
+    )
+    fallback_phase_correlation: bool = param(
+        True, help="Dernier repli : corrélation de phase en espace log-polaire."
+    )
+    min_phase_response: float = param(
+        0.05, minimum=0.0, maximum=1.0, help="Pic minimal de corrélation de phase."
+    )
+
+
+@dataclass
+class RegistrationConfig:
+    """Recalage des frames d'une séquence dans un repère commun."""
+
+    max_consecutive_failures: int = param(
+        5,
+        minimum=0,
+        maximum=100000,
+        help="Échecs d'estimation consécutifs tolérés avant d'interrompre la séquence.",
+    )
+
+
+@dataclass
 class RuntimeConfig:
     """Paramètres d'exécution : reproductibilité, matériel, parallélisme, journalisation."""
 
@@ -132,6 +259,8 @@ class PipelineConfig:
 
     video: VideoIOConfig = field(default_factory=VideoIOConfig)
     preprocess: PreprocessConfig = field(default_factory=PreprocessConfig)
+    motion: MotionConfig = field(default_factory=MotionConfig)
+    registration: RegistrationConfig = field(default_factory=RegistrationConfig)
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
     schema_version: int = CONFIG_SCHEMA_VERSION
 
@@ -162,6 +291,9 @@ class PipelineConfig:
                 raise ConfigError(
                     f"preprocess.exclusion_zones[{i}] : il faut x0 < x1 et y0 < y1, reçu {zone}"
                 )
+
+        if self.motion.ecc_gauss_filter_size % 2 == 0:
+            raise ConfigError("motion.ecc_gauss_filter_size doit être impair")
 
     # ------------------------------------------------------------- sérialisation
     def to_dict(self) -> dict[str, Any]:
