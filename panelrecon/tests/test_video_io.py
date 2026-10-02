@@ -141,16 +141,25 @@ def test_frame_step_and_range(cfr_mp4: Path, small_config: PipelineConfig) -> No
 
 
 def test_max_fps_uses_timestamps(vfr_mkv: Path, small_config: PipelineConfig) -> None:
-    small_config.video.max_fps = 10.0  # au plus une frame par créneau de 100 ms
-    frames = _read_all(vfr_mkv, small_config)
-    buckets = [int(np.floor(f.time_s * 10.0 + 0.1)) for f in frames]
+    small_config.video.max_fps = 10.0
+    with VideoReader(vfr_mkv, small_config.video, small_config.preprocess) as reader:
+        frames = list(reader.frames())
+        fps = reader.info.fps
+    rate = fps / max(1, int(fps / 10.0 + 1e-6))  # décimation entière de la cadence nominale
+    buckets = [int(np.floor(f.time_s * rate + 0.1)) for f in frames]
     assert buckets == sorted(set(buckets))  # une frame par créneau, ordre conservé
-    expected_buckets = sorted({int(np.floor(t * 10.0 + 0.1)) for t in VFR_TIMES})
-    assert buckets == expected_buckets  # chaque créneau occupé garde sa première frame
     first_of_bucket: dict[int, int] = {}
     for i, t in enumerate(VFR_TIMES):
-        first_of_bucket.setdefault(int(np.floor(t * 10.0 + 0.1)), i)
-    assert [f.index for f in frames] == [first_of_bucket[b] for b in expected_buckets]
+        first_of_bucket.setdefault(int(np.floor(t * rate + 0.1)), i)
+    assert [f.index for f in frames] == [first_of_bucket[b] for b in sorted(first_of_bucket)]
+
+
+def test_max_fps_is_an_integer_decimation(cfr_mp4: Path, small_config: PipelineConfig) -> None:
+    """25 i/s plafonnés à 15 : pas de décimation (⌊25/15⌋ = 1), toutes les frames gardées."""
+    small_config.video.max_fps = 15.0
+    assert len(_read_all(cfr_mp4, small_config)) == N_FRAMES
+    small_config.video.max_fps = 12.0  # ⌊25/12⌋ = 2 : une frame sur deux
+    assert [f.index for f in _read_all(cfr_mp4, small_config)] == list(range(0, N_FRAMES, 2))
 
 
 def test_max_fps_halves_60fps_with_rounded_timestamps(tmp_path: Path,

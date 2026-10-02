@@ -24,6 +24,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+
 from panelrecon.core.config import PipelineConfig
 from panelrecon.core.export import (
     ExportedFiles,
@@ -38,7 +40,7 @@ from panelrecon.core.models import (
     Sequence,
     VideoInfo,
 )
-from panelrecon.core.mosaic import build_mosaic
+from panelrecon.core.mosaic import build_mosaic, plan_fusion
 from panelrecon.core.scene_split import SplitResult, split_and_register
 from panelrecon.core.segmentation import PanelRegion, PanelRegionEstimator
 from panelrecon.core.video_io import VideoReader
@@ -142,7 +144,16 @@ def _segment(
         return {}
     starts = [s.sequence.start_idx for s in split.sequences]
     estimators: dict[int, PanelRegionEstimator] = {}
-    for frame in reader.frames():
+    # Un échantillon de frames bien réparties suffit à cumuler les preuves.
+    sample: set[int] = set()
+    limit = config.segmentation.max_frames
+    for item in split.sequences:
+        indices = sorted(item.registration.transforms)
+        if len(indices) > limit:
+            picks = np.linspace(0, len(indices) - 1, limit)
+            indices = [indices[int(round(p))] for p in picks]
+        sample.update(indices)
+    for frame in reader.frames(proxy_only=True, wanted=sample):
         if cancel is not None:
             cancel.raise_if_cancelled()
         progress((frame.index + 1) / total, f"segmentation {frame.index}")
@@ -184,7 +195,7 @@ def process_video(
             report_split = _scaled(progress, 0.0, 0.4)
 
             def split_frames() -> Iterator[FrameObs]:
-                for frame in reader.frames():
+                for frame in reader.frames(proxy_only=True):
                     report_split((frame.index + 1) / total, f"découpage {frame.index}")
                     yield frame
 
@@ -194,7 +205,19 @@ def process_video(
                 raise ValueError("Aucune séquence exploitable dans la vidéo")
             regions = _segment(reader, split, config, cancel, _scaled(progress, 0.4, 0.15), total)
 
-            stream = _SharedStream(reader.frames(compute_proxy=False))
+            # Seules les frames retenues pour la fusion sont converties (résolution native).
+            plans = {}
+            needed: set[int] = set()
+            for k, item in enumerate(split.sequences):
+                region = regions.get(k)
+                try:
+                    plans[k] = plan_fusion(item.registration, config,
+                                           None if region is None else region.bounds())
+                    needed.update(plans[k][2])
+                except (ValueError, MemoryError) as exc:
+                    logger.warning("Séquence %d : planification de la fusion impossible (%s)",
+                                   k, exc)
+            stream = _SharedStream(reader.frames(compute_proxy=False, wanted=needed))
             n = len(split.sequences)
             for k, item in enumerate(split.sequences):
                 if cancel is not None:

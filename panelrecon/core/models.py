@@ -326,9 +326,12 @@ class MotionEstimate:
 class FrameObs:
     """Une frame décodée.
 
-    ``image`` est en BGR uint8 à la résolution native. ``proxy_gray`` est la
-    version réduite en niveaux de gris utilisée pour l'estimation du mouvement,
-    avec ``p_proxy = proxy_factor · p_natif``.
+    ``image`` est en BGR uint8, à la résolution native sauf en lecture « image
+    réduite seule », où elle est à la taille de ``proxy_gray`` et où
+    ``native_size`` donne la taille native. ``proxy_gray`` est la version réduite
+    en niveaux de gris utilisée pour l'estimation du mouvement, avec
+    ``p_proxy = proxy_factor · p_natif``. Les transformations sont toujours
+    exprimées en coordonnées **natives**.
     """
 
     index: int
@@ -337,6 +340,7 @@ class FrameObs:
     image: ImageU8
     proxy_gray: ImageU8 | None = None
     proxy_factor: float = 1.0
+    native_size: tuple[int, int] | None = None  # (largeur, hauteur) si image réduite
 
     def __post_init__(self) -> None:
         if self.index < 0:
@@ -357,6 +361,18 @@ class FrameObs:
     @property
     def width(self) -> int:
         return int(self.image.shape[1])
+
+    @property
+    def native_width(self) -> int:
+        return self.native_size[0] if self.native_size is not None else self.width
+
+    @property
+    def native_height(self) -> int:
+        return self.native_size[1] if self.native_size is not None else self.height
+
+    @property
+    def is_native(self) -> bool:
+        return self.native_size is None or self.native_size == (self.width, self.height)
 
 
 @dataclass(frozen=True)

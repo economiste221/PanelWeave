@@ -290,6 +290,29 @@ class _ObservationStack:
             logger.info("Pile d'observations sur disque : %.0f Mio dans %s", nbytes / 2**20, tmp)
 
 
+def plan_fusion(
+    registration: RegistrationResult,
+    config: PipelineConfig,
+    clip: tuple[float, float, float, float] | None = None,
+) -> tuple[Canvas, dict[int, SimilarityTransform], list[int]]:
+    """Canevas, transformations ``frame → canevas`` et frames retenues pour la fusion.
+
+    Ne dépend que du recalage : permet de ne décoder que les frames retenues.
+    """
+    cfg = config.mosaic
+    transforms = registration.transforms
+    if not transforms:
+        raise ValueError("Aucune frame recalée")
+    # Canevas : emprise des frames, restreinte à celle du panel quand elle est connue.
+    regions = {i: corners(*registration.frame_sizes[i]) for i in transforms}
+    canvas = plan_canvas(transforms, regions, cfg.max_canvas_megapixels, clip)
+    to_canvas = {i: canvas.offset @ t for i, t in transforms.items()}
+    chosen = select_observations(to_canvas, registration.frame_sizes, canvas,
+                                 cfg.max_observations, cfg.selection_cell_px,
+                                 cfg.scale_weight_power)
+    return canvas, to_canvas, chosen
+
+
 def build_mosaic(
     frames: Iterable[FrameObs],
     registration: RegistrationResult,
@@ -307,17 +330,8 @@ def build_mosaic(
     """
     cfg = config.mosaic
     transforms = registration.transforms
-    if not transforms:
-        raise ValueError("Aucune frame recalée")
     interpolation = _INTERPOLATIONS[cfg.interpolation]
-
-    # Canevas : emprise des frames, restreinte à celle du panel quand elle est connue.
-    regions = {i: corners(*registration.frame_sizes[i]) for i in transforms}
-    canonical = plan_canvas(transforms, regions, cfg.max_canvas_megapixels, clip)
-    all_to_canvas = {i: canonical.offset @ t for i, t in transforms.items()}
-    chosen = select_observations(all_to_canvas, registration.frame_sizes, canonical,
-                                 cfg.max_observations, cfg.selection_cell_px,
-                                 cfg.scale_weight_power)
+    canonical, all_to_canvas, chosen = plan_fusion(registration, config, clip)
     to_canvas = {i: all_to_canvas[i] for i in chosen}
     if len(chosen) < len(transforms):
         logger.info("Fusion : %d frames retenues sur %d (observations redondantes écartées)",
@@ -336,6 +350,8 @@ def build_mosaic(
                 cancel.raise_if_cancelled()
             if frame.index not in slot:
                 continue
+            if not frame.is_native:
+                raise ValueError("La fusion exige des frames à la résolution native")
             mask = validity_mask(frame, config, panel_masks(frame) if panel_masks else None)
             _warp_observation(frame, mask, to_canvas[frame.index], canonical, obs.data[slot[frame.index]],
                               interpolation, cfg.edge_feather_px, cfg.min_edge_weight)

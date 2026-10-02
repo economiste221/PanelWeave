@@ -13,7 +13,7 @@ from __future__ import annotations
 import logging
 import math
 from collections import deque
-from collections.abc import Iterable, Iterator
+from collections.abc import Collection, Iterable, Iterator
 from fractions import Fraction
 from pathlib import Path
 from typing import Protocol
@@ -229,13 +229,45 @@ class FrameRingBuffer:
 
 
 class _RawFrame:
-    __slots__ = ("image", "pts", "time_s", "rotation_deg")
+    """Frame décodée dont la conversion en image est différée : seules les frames
+    effectivement gardées sont converties, et directement à la taille demandée."""
 
-    def __init__(self, image: ImageU8, pts: int | None, time_s: float | None, rotation_deg: int):
-        self.image = image
+    __slots__ = ("_av", "_array", "pts", "time_s", "rotation_deg")
+
+    def __init__(
+        self,
+        source: av.VideoFrame | ImageU8,
+        pts: int | None,
+        time_s: float | None,
+        rotation_deg: int,
+    ) -> None:
+        self._av = source if isinstance(source, av.VideoFrame) else None
+        self._array = None if isinstance(source, av.VideoFrame) else source
         self.pts = pts
         self.time_s = time_s
         self.rotation_deg = rotation_deg
+
+    @property
+    def stored_size(self) -> tuple[int, int]:
+        """Taille ``(largeur, hauteur)`` stockée (avant rotation d'affichage)."""
+        if self._av is not None:
+            return int(self._av.width), int(self._av.height)
+        assert self._array is not None
+        return int(self._array.shape[1]), int(self._array.shape[0])
+
+    def image(self, size: tuple[int, int] | None = None) -> ImageU8:
+        """Image BGR à la taille stockée, ou réduite à ``size`` (filtre « area »)."""
+        if self._av is not None:
+            if size is None:
+                array = self._av.to_ndarray(format="bgr24")
+            else:
+                array = self._av.to_ndarray(width=size[0], height=size[1], format="bgr24",
+                                            interpolation="AREA")
+            return np.ascontiguousarray(array, dtype=np.uint8)
+        assert self._array is not None
+        if size is None or size == self.stored_size:
+            return self._array
+        return np.asarray(cv2.resize(self._array, size, interpolation=cv2.INTER_AREA), np.uint8)
 
 
 class _Backend(Protocol):
@@ -326,9 +358,8 @@ class _PyAVBackend:
                     ) from exc
                 continue
             for frame in decoded:
-                image = np.asarray(frame.to_ndarray(format="bgr24"), dtype=np.uint8)
                 time_s = float(frame.time) if frame.time is not None else None
-                yield _RawFrame(image, frame.pts, time_s, int(frame.rotation))
+                yield _RawFrame(frame, frame.pts, time_s, int(frame.rotation))
 
     def close(self) -> None:
         self._container.close()
@@ -464,8 +495,15 @@ class VideoReader:
         start_index: int = 0,
         stop_index: int | None = None,
         compute_proxy: bool = True,
+        proxy_only: bool = False,
+        wanted: Collection[int] | None = None,
     ) -> Iterator[FrameObs]:
         """Génère les frames d'indice ``start_index ≤ i < stop_index``.
+
+        * ``proxy_only`` : l'image n'est convertie qu'à la taille réduite (bien plus
+          rapide) ; ``FrameObs.native_size`` donne alors la taille native.
+        * ``wanted`` : seules ces frames sont converties et renvoyées (les autres
+          sont décodées puis ignorées, les indices restent ceux du flux complet).
 
         Chaque appel relit la vidéo depuis le début (décodage séquentiel exact,
         indépendant de la précision du seek du conteneur).
@@ -480,9 +518,13 @@ class VideoReader:
         self.decode_errors = 0
         self.frames_decoded = 0
         step = self._video_cfg.frame_step
-        max_fps = self._video_cfg.max_fps
-        last_bucket: int | None = None
         fps = backend.info.fps if backend.info.fps > 0 else 0.0
+        max_fps = self._video_cfg.max_fps
+        if max_fps > 0.0 and fps > 0.0:
+            # Décimation entière : on garde une frame sur k, k = ⌊fps / max_fps⌋ (≥ 1).
+            # 60 i/s → 15, 30 → 15, 25 ou 24 → inchangé (pas d'échantillonnage irrégulier).
+            max_fps = fps / max(1, int(fps / max_fps + 1e-6))
+        last_bucket: int | None = None
         try:
             for index, raw in enumerate(backend.iter_raw()):
                 self.frames_decoded = index + 1
@@ -503,7 +545,12 @@ class VideoReader:
                     if last_bucket is not None and bucket <= last_bucket:
                         continue
                     last_bucket = bucket
-                image = self._apply_rotation(raw.image, raw.rotation_deg)
+                if wanted is not None and index not in wanted:
+                    continue
+                if proxy_only:
+                    yield self._make_proxy_obs(index, time_s, raw)
+                    continue
+                image = self._apply_rotation(raw.image(), raw.rotation_deg)
                 yield self._make_obs(index, time_s, raw.pts, image, compute_proxy)
         finally:
             self.decode_errors = backend.decode_errors
@@ -531,6 +578,26 @@ class VideoReader:
                 self._rotation_warned = True
             return image
         return _rotate_quarter_turns(image, rotation_deg)
+
+    def _make_proxy_obs(self, index: int, time_s: float, raw: _RawFrame) -> FrameObs:
+        """Frame convertie directement à la taille réduite (rotation d'affichage incluse)."""
+        stored_w, stored_h = raw.stored_size
+        quarter = (self._video_cfg.apply_display_rotation and raw.rotation_deg % 90 == 0
+                   and raw.rotation_deg % 180 != 0)
+        native_w, native_h = (stored_h, stored_w) if quarter else (stored_w, stored_h)
+        factor = compute_proxy_factor(native_w, native_h, self._pre_cfg.motion_long_side)
+        proxy_w, proxy_h = proxy_size(native_w, native_h, factor)
+        small = raw.image((proxy_h, proxy_w) if quarter else (proxy_w, proxy_h))
+        small = self._apply_rotation(small, raw.rotation_deg)
+        return FrameObs(
+            index=index,
+            time_s=time_s,
+            pts=raw.pts,
+            image=np.ascontiguousarray(small),
+            proxy_gray=to_gray(small),
+            proxy_factor=min(1.0, proxy_w / float(native_w)),
+            native_size=(native_w, native_h),
+        )
 
     def _make_obs(
         self, index: int, time_s: float, pts: int | None, image: ImageU8, compute_proxy: bool

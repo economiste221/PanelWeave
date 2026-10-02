@@ -162,7 +162,7 @@ class SequenceTracker:
         hist = hsv_histogram(small)
         content_cut = bool(self._detector.process_frame(frame.index, small)) if self._detector else False
         mf = motion_frame if motion_frame is not None else make_motion_frame(frame, self.config)
-        size = (frame.width, frame.height)
+        size = (frame.native_width, frame.native_height)
         prev, prev_hist = self._prev_frame, self._prev_hist
         self._prev_frame, self._prev_hist = mf, hist
         if prev is None or prev_hist is None:

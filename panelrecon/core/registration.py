@@ -116,7 +116,7 @@ def make_motion_frame(
     if config.preprocess.exclusion_zones:
         mask = build_exclusion_mask(h, w, config.preprocess.exclusion_zones)
     if panel_mask is not None:
-        if panel_mask.shape != frame.image.shape[:2]:
+        if panel_mask.shape != (frame.native_height, frame.native_width):
             raise ValueError("Le masque du panel doit avoir la taille native de la frame")
         small = make_proxy(panel_mask, frame.proxy_factor)
         if small.shape != (h, w):
@@ -405,7 +405,8 @@ def register_frames(
         if cancel is not None:
             cancel.raise_if_cancelled()
         mask = panel_masks(frame) if panel_masks is not None else None
-        registrar.add(make_motion_frame(frame, config, mask), (frame.width, frame.height))
+        registrar.add(make_motion_frame(frame, config, mask),
+                     (frame.native_width, frame.native_height))
         if registrar.interrupted:
             break
     result = registrar.result()

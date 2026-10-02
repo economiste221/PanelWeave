@@ -209,7 +209,10 @@ class PanelRegion:
     def mask(self, frame: FrameObs) -> MaskU8:
         """Masque natif du panel dans ``frame``."""
         to_frame = self.transforms[frame.index].inverse()
-        return polygon_mask(to_frame.apply(self.polygon), (frame.width, frame.height))
+        corners_native = to_frame.apply(self.polygon)
+        if not frame.is_native:  # image réduite : coordonnées natives → image
+            corners_native = corners_native * (frame.width / float(frame.native_width))
+        return polygon_mask(corners_native, (frame.width, frame.height))
 
     def bounds(self) -> tuple[float, float, float, float]:
         return (float(self.polygon[:, 0].min()), float(self.polygon[:, 1].min()),

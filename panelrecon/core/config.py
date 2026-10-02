@@ -67,12 +67,12 @@ class VideoIOConfig:
         1, minimum=1, maximum=1000, help="Ne garder qu'une frame décodée sur N."
     )
     max_fps: float = param(
-        30.0,
+        15.0,
         minimum=0.0,
         maximum=1000.0,
-        help="Cadence maximale conservée, appliquée sur les timestamps (0 = pas de limite). "
-        "30 i/s suffisent : au-delà, les frames consécutives d'un panel animé sont quasi "
-        "identiques.",
+        help="Cadence d'analyse visée (0 = toutes les frames). Décimation entière : une frame "
+        "sur ⌊fps/max_fps⌋ (60 i/s → 15, 30 → 15, 25 → 25). Au-delà de ~15 i/s, les frames "
+        "consécutives d'un panel animé sont quasi identiques.",
     )
     decode_threads: int = param(
         0, minimum=0, maximum=64, help="Threads de décodage FFmpeg (0 = automatique)."
@@ -93,7 +93,7 @@ class PreprocessConfig:
     """Prétraitement des frames avant estimation du mouvement."""
 
     motion_long_side: int = param(
-        960,
+        640,
         minimum=64,
         maximum=8192,
         help="Côté long (px) de la version réduite utilisée pour l'estimation du mouvement.",
@@ -415,6 +415,12 @@ class SegmentationConfig:
         maximum=1.0,
         help="…et si la part de ses points texturés à grande échelle dépasse celui-ci.",
     )
+    max_frames: int = param(
+        60,
+        minimum=2,
+        maximum=100000,
+        help="Frames (réparties dans la séquence) utilisées pour estimer l'emprise du panel.",
+    )
     closing_px: int = param(
         15, minimum=0, maximum=500, help="Fermeture morphologique des preuves de panel (px réduits)."
     )
@@ -468,7 +474,7 @@ class MosaicConfig:
     )
     tile_size: int = param(256, minimum=16, maximum=8192, help="Côté des tuiles de fusion (px).")
     max_observations: int = param(
-        24,
+        12,
         minimum=0,
         maximum=100000,
         help="Observations visées par zone du canevas : au-delà, les frames redondantes ne sont "
