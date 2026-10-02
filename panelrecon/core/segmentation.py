@@ -40,7 +40,7 @@ from numpy.typing import NDArray
 from panelrecon.core.config import PipelineConfig, SegmentationConfig
 from panelrecon.core.geometry import corners
 from panelrecon.core.models import FrameObs, ImageU8, MaskU8, SimilarityTransform
-from panelrecon.core.video_io import compute_proxy_factor, make_proxy, to_gray
+from panelrecon.core.video_io import compute_proxy_factor, letterbox_mask, make_proxy, to_gray
 
 logger = logging.getLogger(__name__)
 
@@ -246,6 +246,7 @@ class PanelRegionEstimator:
         shape = (self.height, self.width)
         self.count = np.zeros(shape, np.uint16)
         self.hits = np.zeros(shape, np.uint16)
+        self.coarse = np.zeros(shape, np.uint16)
         self.total = np.zeros(shape, np.float32)
         self.total_sq = np.zeros(shape, np.float32)
         self.x_min = np.full(shape, np.inf, np.float32)
@@ -271,7 +272,11 @@ class PanelRegionEstimator:
         local = SimilarityTransform.from_translation(-x0, -y0) @ m
         size = (x1 - x0, y1 - y0)
         mat = local.matrix()
-        footprint = cv2.warpAffine(np.full((h, w), 255, np.uint8), mat, size,
+        observable: MaskU8 = np.full((h, w), 255, np.uint8)
+        if self.config.preprocess.letterbox_detection:
+            observable = letterbox_mask(gray, self.config.preprocess.letterbox_max_level,
+                                        self.config.preprocess.letterbox_max_std)
+        footprint = cv2.warpAffine(observable, mat, size,
                                    flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT,
                                    borderValue=0)
         valid: NDArray[np.bool_] = np.asarray(
@@ -279,8 +284,19 @@ class PanelRegionEstimator:
                       borderValue=0) > 0)
         values = np.asarray(cv2.warpAffine(gray.astype(np.float32), mat, size,
                                            flags=cv2.INTER_LINEAR), dtype=np.float32)
+        # Une preuve de netteté ne compte que si toute sa fenêtre de mesure est dans
+        # la zone observable (le contraste avec une bande noire n'est pas du panel).
+        reach = self.cfg.sharpness_window // 2 + 2
+        inner = cv2.erode(observable, np.ones((2 * reach + 1, 2 * reach + 1), np.uint8),
+                          borderType=cv2.BORDER_REPLICATE) > 0
+        sharp_local = sharp_evidence(gray, self.cfg) & inner
         sharp: NDArray[np.bool_] = np.asarray(
-            cv2.warpAffine(sharp_evidence(gray, self.cfg).astype(np.uint8), mat, size,
+            cv2.warpAffine(sharp_local.astype(np.uint8), mat, size, flags=cv2.INTER_NEAREST) > 0)
+        smooth = cv2.GaussianBlur(gray.astype(np.float32), (0, 0), self.cfg.blur_gradient_sigma)
+        coarse_mag = cv2.magnitude(cv2.Sobel(smooth, cv2.CV_32F, 1, 0),
+                                   cv2.Sobel(smooth, cv2.CV_32F, 0, 1))
+        coarse: NDArray[np.bool_] = np.asarray(
+            cv2.warpAffine((coarse_mag > self.cfg.blur_min_gradient).astype(np.uint8), mat, size,
                            flags=cv2.INTER_NEAREST) > 0)
         # Position à l'écran (px réduits) de chaque point du canevas.
         inv = local.inverse().matrix()
@@ -290,6 +306,7 @@ class PanelRegionEstimator:
         sl = (slice(y0, y1), slice(x0, x1))
         self.count[sl] += valid
         self.hits[sl] += valid & sharp
+        self.coarse[sl] += valid & coarse
         self.total[sl] += np.where(valid, values, 0)
         self.total_sq[sl] += np.where(valid, values * values, 0)
         self.x_min[sl] = np.where(valid, np.minimum(self.x_min[sl], sx), self.x_min[sl])
@@ -392,9 +409,23 @@ class PanelRegionEstimator:
             # ``lines`` : (positions le long du côté, épaisseur de bande)
             return bool(lines.any(axis=1).mean() >= self.cfg.boundary_min_fraction)
 
-        def is_background(strip_std: F32, strip_moved: NDArray[np.bool_]) -> bool:
-            values = strip_std[strip_moved]
-            return values.size >= 16 and float(np.median(values)) > bg_threshold
+        textured = observed & (self.coarse >= 0.5 * np.maximum(self.count, 1))
+
+        def is_background(region: tuple[slice, slice]) -> bool:
+            # Fond animé autrement que le panel : forte variation temporelle.
+            values = std[region][moved[region]]
+            if values.size >= 16 and float(np.median(values)) > bg_threshold:
+                return True
+            # Fond flou (agrandissement du panel) : variations à grande échelle sans
+            # aucun détail net, même s'il glisse avec le panel.
+            obs = observed[region]
+            n = int(obs.sum())
+            if n < 16:
+                return False
+            sharp_fraction = float(sharp[region][obs].mean())
+            texture_fraction = float(textured[region][obs].mean())
+            return (sharp_fraction < self.cfg.blur_max_sharp_fraction
+                    and texture_fraction >= self.cfg.blur_min_texture_fraction)
 
         rows = observed[y0:y1]
         cols = observed[:, x0:x1]
@@ -406,16 +437,16 @@ class PanelRegionEstimator:
 
         opened = [False, False, False, False]
         if lim_x0 < x0 and not is_border(sharp[y0:y1, x0 : x0 + band]) and not is_background(
-                std[y0:y1, lim_x0:x0], moved[y0:y1, lim_x0:x0]):
+                (slice(y0, y1), slice(lim_x0, x0))):
             x0, opened[0] = lim_x0, True
         if lim_x1 > x1 and not is_border(sharp[y0:y1, x1 - band : x1]) and not is_background(
-                std[y0:y1, x1:lim_x1], moved[y0:y1, x1:lim_x1]):
+                (slice(y0, y1), slice(x1, lim_x1))):
             x1, opened[1] = lim_x1, True
         if lim_y0 < y0 and not is_border(sharp[y0 : y0 + band, x0:x1].T) and not is_background(
-                std[lim_y0:y0, x0:x1], moved[lim_y0:y0, x0:x1]):
+                (slice(lim_y0, y0), slice(x0, x1))):
             y0, opened[2] = lim_y0, True
         if lim_y1 > y1 and not is_border(sharp[y1 - band : y1, x0:x1].T) and not is_background(
-                std[y1:lim_y1, x0:x1], moved[y1:lim_y1, x0:x1]):
+                (slice(y1, lim_y1), slice(x0, x1))):
             y1, opened[3] = lim_y1, True
         # Un côté déjà à la limite observée n'a rien au-delà : il ne délimite pas le panel.
         opened[0] |= x0 <= lim_x0

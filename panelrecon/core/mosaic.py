@@ -46,7 +46,7 @@ from panelrecon.core.models import (
     SimilarityTransform,
 )
 from panelrecon.core.registration import PanelMaskProvider, RegistrationResult
-from panelrecon.core.video_io import build_exclusion_mask
+from panelrecon.core.video_io import build_exclusion_mask, letterbox_mask, to_gray
 
 logger = logging.getLogger(__name__)
 
@@ -82,7 +82,8 @@ class Canvas:
 def validity_mask(
     frame: FrameObs, config: PipelineConfig, panel_mask: MaskU8 | None = None
 ) -> MaskU8:
-    """Pixels natifs exploitables : panel ∩ hors bords d'écran ∩ hors zones d'exclusion."""
+    """Pixels natifs exploitables : panel ∩ hors bords d'écran ∩ hors bandes noires
+    (letterbox) ∩ hors zones d'exclusion."""
     h, w = frame.height, frame.width
     cfg = config.mosaic
     mask = build_exclusion_mask(h, w, config.preprocess.exclusion_zones)
@@ -92,6 +93,11 @@ def validity_mask(
         mask[h - b :] = 0
         mask[:, :b] = 0
         mask[:, w - b :] = 0
+    if config.preprocess.letterbox_detection:
+        bars = letterbox_mask(to_gray(frame.image),
+                              config.preprocess.letterbox_max_level,
+                              config.preprocess.letterbox_max_std)
+        mask = np.where(bars > 0, mask, 0).astype(np.uint8)
     if panel_mask is not None:
         if panel_mask.shape != (h, w):
             raise ValueError("Le masque du panel doit avoir la taille native de la frame")

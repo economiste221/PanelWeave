@@ -142,3 +142,34 @@ def test_classic_segmenter_per_frame(registered: RegistrationCache) -> None:
             recall = (m & truth).sum() / truth.sum()
             precision = (m & truth).sum() / max(1, m.sum())
             assert recall > 0.95 and precision > 0.9, (frame.index, recall, precision)
+
+
+def test_rigid_sliding_composition_with_letterbox() -> None:
+    """Cas réel reproduit : panel étroit + fond flou (agrandissement du panel) qui
+    glissent d'un bloc dans un cadre à bandes noires. Le fond ne varie pas dans le
+    temps ; seuls son flou et l'exclusion des bandes noires permettent d'isoler le panel."""
+    panel = make_panel(PanelSpec(220, 340, "rich", seed=5))
+    bg = cv2.GaussianBlur(cv2.resize(panel, (900, 1390)), (0, 0), 18)[500:860, 200:840]
+    composition = np.ascontiguousarray(bg)
+    x_panel = 210
+    composition[10:350, x_panel:x_panel + 220] = panel
+    cfg = PipelineConfig()
+    frames, transforms = [], {}
+    for i in range(16):
+        dx = -40 + 6 * i  # toute la composition glisse horizontalement
+        image = np.zeros((360, 640, 3), np.uint8)
+        c0, c1 = max(0, dx + 60), min(640, dx + 60 + 520)
+        image[:, c0:c1] = composition[:, c0 - (dx + 60) : c1 - (dx + 60)]
+        gray = np.asarray(cv2.cvtColor(image, cv2.COLOR_BGR2GRAY), dtype=np.uint8)
+        frames.append(FrameObs(i, i / 25, i, image, gray, 1.0))
+        transforms[i] = SimilarityTransform.from_translation(-dx, 0.0)
+    estimator = PanelRegionEstimator(cfg, transforms, {i: (640, 360) for i in range(16)}, 1.0)
+    for frame in frames:
+        estimator.add(frame)
+    region = estimator.estimate()
+    x0, y0, x1, y1 = region.bounds()
+    # Panel dans le repère de référence (frame avec dx = 0) : x ∈ [60+210, 60+430[, y ∈ [10, 350[.
+    # Tolérance de 4 px : un côté délimitant est placé prudemment sur le bord intérieur
+    # de la bordure, jamais dans le fond.
+    assert abs(x0 - (60 + x_panel - 0.5)) <= 4 and abs(x1 - (60 + x_panel + 220 - 0.5)) <= 4
+    assert abs(y0 - 9.5) <= 4 and abs(y1 - 349.5) <= 4

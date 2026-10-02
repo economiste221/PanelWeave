@@ -23,6 +23,7 @@ import av.container
 import av.error
 import cv2
 import numpy as np
+from numpy.typing import NDArray
 
 from panelrecon.core.config import ExclusionZone, PreprocessConfig, VideoIOConfig
 from panelrecon.core.models import (
@@ -134,6 +135,33 @@ def build_exclusion_mask(
         r1 = min(height, int(math.ceil(y1 * height)))
         if c1 > c0 and r1 > r0:
             mask[r0:r1, c0:c1] = 0
+    return mask
+
+
+def letterbox_mask(gray: ImageU8, max_level: float, max_std: float) -> MaskU8:
+    """Masque 255 hors des bandes uniformes quasi noires collées aux bords.
+
+    Une bande est une suite contiguë, depuis un bord, de colonnes (ou lignes) dont
+    la moyenne est ≤ ``max_level`` et l'écart-type ≤ ``max_std``.
+    """
+    h, w = gray.shape
+    g = gray.astype(np.float32)
+    mask: MaskU8 = np.full((h, w), 255, dtype=np.uint8)
+
+    def run_length(flags: NDArray[np.bool_]) -> int:
+        return int(np.argmin(flags)) if not flags.all() else int(flags.size)
+
+    cols = (g.mean(axis=0) <= max_level) & (g.std(axis=0) <= max_std)
+    rows = (g.mean(axis=1) <= max_level) & (g.std(axis=1) <= max_std)
+    left, right = run_length(cols), run_length(cols[::-1])
+    top, bottom = run_length(rows), run_length(rows[::-1])
+    if left + right >= w or top + bottom >= h:  # frame entièrement noire
+        mask[:] = 0
+        return mask
+    mask[:, :left] = 0
+    mask[:, w - right :] = 0
+    mask[:top] = 0
+    mask[h - bottom :] = 0
     return mask
 
 

@@ -259,3 +259,20 @@ def test_display_rotation_matches_ffmpeg(
     small_config.video.apply_display_rotation = False
     frames = _read_all(rotated, small_config, stop_index=1)
     assert frames[0].image.shape == (240, 320, 3)
+
+
+def test_letterbox_mask() -> None:
+    from panelrecon.core.video_io import letterbox_mask
+
+    gray = np.full((60, 100), 120, np.uint8)
+    gray[:, :15] = 3  # bande noire à gauche
+    gray[:, 90:] = 0  # bande noire à droite
+    gray[:5] = 2  # bande en haut
+    mask = letterbox_mask(gray, 20.0, 4.0)
+    assert not mask[:, :15].any() and not mask[:, 90:].any() and not mask[:5].any()
+    assert mask[5:, 15:90].all()
+    # Une zone sombre texturée au bord n'est pas une bande uniforme.
+    textured = gray.copy()
+    textured[:, :15] = np.tile([0, 40], (60, 8))[:, :15].astype(np.uint8)
+    assert letterbox_mask(textured, 20.0, 4.0)[:, :15].any()
+    assert not letterbox_mask(np.zeros((10, 10), np.uint8), 20.0, 4.0).any()

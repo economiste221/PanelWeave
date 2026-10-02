@@ -98,6 +98,17 @@ class PreprocessConfig:
         maximum=8192,
         help="Côté long (px) de la version réduite utilisée pour l'estimation du mouvement.",
     )
+    letterbox_detection: bool = param(
+        True,
+        help="Ignorer les bandes uniformes quasi noires collées aux bords de l'écran "
+        "(letterbox, panel qui entre ou sort par glissement).",
+    )
+    letterbox_max_level: float = param(
+        20.0, minimum=0.0, maximum=255.0, help="Niveau moyen maximal d'une ligne/colonne de bande."
+    )
+    letterbox_max_std: float = param(
+        4.0, minimum=0.0, maximum=128.0, help="Écart-type maximal d'une ligne/colonne de bande."
+    )
     exclusion_zones: tuple[ExclusionZone, ...] = param(
         default_factory=tuple,
         help=(
@@ -343,6 +354,31 @@ class SegmentationConfig:
         minimum=0.0,
         maximum=255.0,
         help="Écart-type temporel médian minimal (niveaux de gris) d'une bande de fond.",
+    )
+    blur_gradient_sigma: float = param(
+        2.0,
+        minimum=0.5,
+        maximum=20.0,
+        help="Lissage (px réduits) avant la mesure des variations à grande échelle.",
+    )
+    blur_min_gradient: float = param(
+        1.0,
+        minimum=0.0,
+        maximum=255.0,
+        help="Gradient minimal (niveaux/px, après lissage) d'un point « texturé à grande échelle ».",
+    )
+    blur_max_sharp_fraction: float = param(
+        0.01,
+        minimum=0.0,
+        maximum=1.0,
+        help="Une bande hors du panel est du fond flou si la part de ses points nets est sous ce "
+        "seuil…",
+    )
+    blur_min_texture_fraction: float = param(
+        0.2,
+        minimum=0.0,
+        maximum=1.0,
+        help="…et si la part de ses points texturés à grande échelle dépasse celui-ci.",
     )
     closing_px: int = param(
         15, minimum=0, maximum=500, help="Fermeture morphologique des preuves de panel (px réduits)."
