@@ -49,7 +49,12 @@ from panelrecon.core.models import (
     SimilarityTransform,
 )
 from panelrecon.core.motion import MotionEstimator, MotionFrame, photometric_consistency
-from panelrecon.core.registration import ChainRegistrar, RegistrationResult, make_motion_frame
+from panelrecon.core.registration import (
+    ChainRegistrar,
+    RegistrationResult,
+    make_motion_frame,
+    merge_registrations,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -358,3 +363,56 @@ def split_and_register(
         len(result.sequences), len(result.transitions), result.frames_seen,
     )
     return result
+
+
+def concatenate_splits(
+    first: SplitResult,
+    second: SplitResult,
+    link: tuple[MotionEstimate, SimilarityTransform] | None,
+    boundary_reason: str,
+) -> SplitResult:
+    """Raccorde les découpages de deux tronçons consécutifs d'une même vidéo.
+
+    ``link`` (estimation et transformation native de la première frame du second
+    tronçon vers la dernière du premier) est fourni quand les deux côtés de la
+    frontière montrent le même panel : les deux séquences sont alors réunies.
+    Sinon la frontière est enregistrée comme une coupe (``boundary_reason``).
+    """
+    result = SplitResult(
+        sequences=list(first.sequences),
+        transitions=list(first.transitions),
+        dropped=[*first.dropped, *second.dropped],
+        discarded=[*first.discarded, *second.discarded],
+        frames_seen=first.frames_seen + second.frames_seen,
+    )
+    following = list(second.sequences)
+    if result.sequences and following:
+        if link is not None:
+            a, b = result.sequences[-1], following.pop(0)
+            estimate, transform = link
+            registration = merge_registrations(a.registration, b.registration, transform,
+                                               estimate)
+            excluded = tuple(sorted(set(a.sequence.excluded) | set(b.sequence.excluded)))
+            result.sequences[-1] = SequenceRegistration(
+                Sequence(a.sequence.start_idx, b.sequence.end_idx, excluded), registration)
+            logger.info("Frontière de tronçon %d→%d : même panel, séquences réunies",
+                        a.sequence.end_idx, b.sequence.start_idx)
+        else:
+            result.transitions.append(Transition(
+                following[0].sequence.start_idx, "cut", (boundary_reason,), ()))
+    result.sequences.extend(following)
+    result.transitions.extend(second.transitions)
+    return result
+
+
+def drop_short_sequences(result: SplitResult, min_frames: int) -> None:
+    """Écarte (en les journalisant) les séquences de moins de ``min_frames`` frames."""
+    kept: list[SequenceRegistration] = []
+    for item in result.sequences:
+        if len(item.registration.transforms) < min_frames:
+            result.dropped.append(item.sequence)
+            logger.info("Séquence %d–%d ignorée (%d frames)", item.sequence.start_idx,
+                        item.sequence.end_idx, len(item.registration.transforms))
+        else:
+            kept.append(item)
+    result.sequences = kept

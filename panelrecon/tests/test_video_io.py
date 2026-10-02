@@ -22,7 +22,12 @@ from panelrecon.core.video_io import (
     to_gray,
 )
 from panelrecon.tests.conftest import FPS, N_FRAMES, VFR_TIMES
-from panelrecon.tests.videofactory import decoded_index, index_frame, write_video
+from panelrecon.tests.videofactory import (
+    decoded_index,
+    index_frame,
+    write_keyframed_video,
+    write_video,
+)
 
 
 def _read_all(path: Path, config: PipelineConfig, **kwargs: object) -> list[FrameObs]:
@@ -285,3 +290,35 @@ def test_letterbox_mask() -> None:
     textured[:, :15] = np.tile([0, 40], (60, 8))[:, :15].astype(np.uint8)
     assert letterbox_mask(textured, 20.0, 4.0)[:, :15].any()
     assert not letterbox_mask(np.zeros((10, 10), np.uint8), 20.0, 4.0).any()
+
+
+# ------------------------------------------------------------ accès direct
+
+
+def test_frame_index_seek_matches_sequential_read(tmp_path: Path,
+                                                  small_config: PipelineConfig) -> None:
+    """Avec un index des frames, une lecture qui commence au milieu de la vidéo
+    (positionnement sur l'image clé précédente) renvoie exactement les mêmes
+    frames, indices et décimation qu'une lecture séquentielle complète."""
+    import pickle
+
+    n = 24
+    path = write_keyframed_video(tmp_path / "gop.mp4", (index_frame(i) for i in range(n)),
+                                 fps=30, gop=7)
+    index = video_io.scan_frame_index(path)
+    assert index is not None and len(index) == n
+    assert pickle.loads(pickle.dumps(index)).index_of(index.pts[5]) == 5
+    for max_fps in (0.0, 12.0):
+        small_config.video.max_fps = max_fps
+        with VideoReader(path, small_config.video, small_config.preprocess,
+                         frame_index=index) as reader:
+            full = [(f.index, decoded_index(f.image)) for f in reader.frames()]
+            assert [i for i, _ in full] == [i for i, v in full if v == i]
+            for start in (1, 6, 7, 8, 15, 18):
+                part = [(f.index, decoded_index(f.image))
+                        for f in reader.frames(start_index=start, stop_index=start + 6)]
+                assert part == [p for p in full if start <= p[0] < start + 6]
+            # Le décodage a bien commencé près de la cible, pas au début du fichier.
+            list(reader.frames(start_index=18))
+            assert reader.frames_decoded < 12
+    assert video_io.scan_frame_index(tmp_path / "absent.mp4") is None

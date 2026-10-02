@@ -34,6 +34,7 @@ import logging
 import sys
 import time
 from collections.abc import Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -44,6 +45,7 @@ from panelrecon import __version__
 from panelrecon.core.config import ConfigError, PipelineConfig
 from panelrecon.core.hardware import resolve_num_workers, select_torch_device
 from panelrecon.core.models import CancellationToken, OperationCancelled
+from panelrecon.core.parallel import WorkerPool
 from panelrecon.core.export import write_json
 from panelrecon.core.pipeline import VideoOutcome, process_video
 from panelrecon.core.registration import RegistrationResult
@@ -294,16 +296,40 @@ def run_reconstruct(
     config: PipelineConfig,
     cancel: CancellationToken | None = None,
 ) -> list[VideoOutcome]:
-    """Reconstruit chaque vidéo ; une vidéo en échec est rapportée sans arrêter le lot."""
+    """Reconstruit chaque vidéo ; une vidéo en échec est rapportée sans arrêter le lot.
+
+    Un seul pool de processus (un par cœur performance par défaut) est partagé
+    par tout le lot ; plusieurs vidéos sont orchestrées en même temps, si bien
+    que leurs tronçons et leurs séquences se répartissent sur tous les processus.
+    """
     videos = discover_videos(inputs, config.video.extensions, config.video.recursive)
     logger.info("%d vidéo(s) trouvée(s)", len(videos))
+    token = cancel if cancel is not None else CancellationToken()
     outcomes: list[VideoOutcome] = []
-    for n, path in enumerate(videos, start=1):
-        logger.info("[%d/%d] %s", n, len(videos), path)
-        outcome = process_video(path, output_dir, config, cancel=cancel)
-        logger.info("  %s en %.1f s", "OK" if outcome.ok else f"ÉCHEC : {outcome.error}",
-                    outcome.elapsed_s)
-        outcomes.append(outcome)
+
+    with WorkerPool(resolve_num_workers(config.runtime.num_workers),
+                    config.runtime.log_level) as pool:
+
+        def run_one(n: int, path: Path) -> VideoOutcome:
+            logger.info("[%d/%d] %s", n, len(videos), path)
+            outcome = process_video(path, output_dir, config, cancel=token, pool=pool)
+            logger.info("[%d/%d] %s : %s en %.1f s (%d tronçon(s))", n, len(videos), path.name,
+                        "OK" if outcome.ok else f"ÉCHEC : {outcome.error}", outcome.elapsed_s,
+                        outcome.chunks)
+            return outcome
+
+        concurrent = 1 if pool.inline else max(1, min(len(videos), pool.workers))
+        with ThreadPoolExecutor(max_workers=concurrent, thread_name_prefix="video") as threads:
+            futures = [threads.submit(run_one, n, path)
+                       for n, path in enumerate(videos, start=1)]
+            try:
+                outcomes = [future.result() for future in futures]
+            except BaseException:
+                token.cancel()
+                pool.cancel_all()
+                for future in futures:
+                    future.cancel()
+                raise
     output_dir.mkdir(parents=True, exist_ok=True)
     write_json(output_dir / BATCH_REPORT_FILENAME, {
         "panelrecon_version": __version__,

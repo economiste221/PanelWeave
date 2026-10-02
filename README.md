@@ -19,10 +19,11 @@ vidéo → séquences → segmentation panel/fond → mouvement inter-frames →
 | 3 | Mouvement (SIFT/ORB + RANSAC + ECC, replis flot dense et corrélation log-polaire), chaînage | ✅ |
 | 4 | Mosaïque, fusion médiane pondérée par tuiles, couverture, recadrage, export, pipeline | ✅ |
 | 5 | Découpage en séquences (coupes, fondus), segmentation panel/fond | ✅ |
-| 6 | Recalage sur mosaïque, ajustement global | à faire |
+| 6 | Ajustement global des poses (images clés, liens à longue portée) | ✅ |
 | 7 | Contrôle qualité, rapport | à faire |
 | 8 | Interface PyQt5 | à faire |
-| 9 | Modules optionnels (LoFTR, RAFT, SAM 2), traitement par lot multiprocessus | à faire |
+| 9 | Traitement multiprocessus (tronçons, séquences, lots) | ✅ |
+| 9 | Modules optionnels (LoFTR, RAFT, SAM 2) | à faire |
 
 ## Plateforme cible
 
@@ -86,6 +87,36 @@ décodage, intervalles min/médian/max, détection de fréquence variable) et `p
 Une vidéo illisible est journalisée avec sa trace sans interrompre le lot.
 Codes de sortie : `0` succès, `1` au moins une vidéo en échec, `2` erreur d'usage/configuration,
 `130` interruption.
+
+## Parallélisme
+
+Le découpage en séquences est séquentiel par nature (chaque frame est recalée sur la
+précédente) ; il est donc parallélisé **par tronçons** :
+
+1. **Index des frames** : les paquets sont lus sans décodage (≈ 0,1 s pour 3 min) ; l'indice
+   d'une frame est le rang de son pts. Il ne dépend pas du point de départ, ce qui permet de
+   décoder n'importe quelle plage en se positionnant sur l'image clé précédente
+   (`VideoReader(..., frame_index=...)`), avec la même décimation qu'en lecture continue.
+2. **Tronçons** : la vidéo est coupée en tronçons d'au plus `runtime.chunk_seconds` (5 min),
+   et au moins en autant de tronçons que de processus tant que chacun dure
+   `runtime.min_chunk_seconds` (30 s). Chaque tronçon est découpé et recalé dans un processus
+   séparé.
+3. **Raccord** : à chaque frontière, la dernière frame du tronçon précédent est recalée sur la
+   première du suivant. Si c'est le même panel (mouvement accepté, histogrammes corrélés,
+   cohérence structurelle ≥ `scenes.dissolve_min_score`), les deux séquences sont réunies (poses
+   composées, repère canonique recalculé) ; sinon la frontière est enregistrée comme une coupe,
+   avec sa raison, dans `<vidéo>_sequences.json`.
+4. **Séquences** : les panels sont indépendants ; chacun (segmentation, fusion, export) est
+   traité par un processus, qui ne décode que la plage de sa séquence.
+5. **Lots** : un seul pool de processus est partagé par toutes les vidéos du lot, et plusieurs
+   vidéos sont orchestrées en même temps : tronçons et séquences de toutes les vidéos se
+   répartissent sur les cœurs.
+
+Les processus sont créés par `spawn` (fonctions de module, arguments sérialisables) ; chacun
+limite ses threads internes (OpenCV, fusion par tuiles) à sa part des cœurs. L'annulation passe
+par un `Event` partagé, vérifié entre les frames. Avec `runtime.num_workers = 1`, tout s'exécute
+dans le processus principal, sans tronçons. Sans index exploitable (repli OpenCV, conteneur sans
+pts), la vidéo est traitée séquentiellement en trois passes.
 
 ## Découpage en séquences et segmentation (phase 5)
 
@@ -272,7 +303,7 @@ ses choix et un texte d'aide (réutilisés par l'interface en phase 8). Sections
 
 * `video` : extensions, récursivité, repli OpenCV, `frame_step`, `max_fps` (sur timestamps),
   threads de décodage, rotation d'affichage, tolérance aux paquets corrompus ;
-* `preprocess` : côté long de la version réduite pour le mouvement (960 px), zones d'exclusion
+* `preprocess` : côté long de la version réduite pour le mouvement (640 px), zones d'exclusion
   relatives (sous-titres, logos) ;
 * `motion` : détecteur, nombre de points, étirement de contraste et détection « peu texturée »,
   ratio de Lowe, paramètres RANSAC, inliers et taux minimaux, érosion du masque, régularisation et
@@ -290,8 +321,10 @@ ses choix et un texte d'aide (réutilisés par l'interface en phase 8). Sections
   rampe et poids minimal de bord, puissance du poids d'échelle, taille des tuiles, couverture
   minimale, mode de recadrage, seuil de pile sur disque et dossier temporaire ;
 * `export` : carte de couverture, transformations dans le rapport, compression PNG ;
-* `runtime` : graine, device (`auto` = CUDA → MPS → CPU), nombre de workers
-  (`0` = cœurs performance via `sysctl hw.perflevel0.physicalcpu`), niveau de journalisation.
+* `runtime` : graine, device (`auto` = CUDA → MPS → CPU), nombre de processus
+  (`0` = cœurs performance via `sysctl hw.perflevel0.physicalcpu`), durée maximale et minimale
+  des tronçons de découpage (`chunk_seconds` = 300 s, `min_chunk_seconds` = 30 s), niveau de
+  journalisation.
 
 Les sections des phases suivantes seront ajoutées au fil de l'eau (`schema_version` contrôle la
 compatibilité des profils).
@@ -400,8 +433,9 @@ est limité à l'emprise du panel. Limites restantes :
 * **Fondu sans changement d'histogramme** (deux panels aux palettes identiques) : détecté par le
   contrôle à décalage, avec un retard ; les 1 à 2 premières frames de mélange peuvent rester dans
   la séquence précédente (leur faible contamination est atténuée par la médiane).
-* **Trois passes de décodage** : le décodage est peu coûteux devant l'estimation du mouvement, mais
-  le temps de traitement inclut trois lectures de la vidéo.
+* **Frontières de tronçons** : un fondu qui chevauche une frontière peut laisser une ou deux
+  frames de mélange former une séquence très courte ; un panel coupé par une frontière perd les
+  liens anti-dérive entre ses deux morceaux (chaque morceau est ajusté séparément).
 * Dérive du chaînage (≤ 0,8 px aux coins sur 30 frames peu texturées) : recalage sur mosaïque et
   ajustement global en phase 6.
 

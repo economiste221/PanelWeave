@@ -14,6 +14,7 @@ import logging
 import math
 from collections import deque
 from collections.abc import Collection, Iterable, Iterator
+from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
 from typing import Protocol
@@ -274,7 +275,7 @@ class _Backend(Protocol):
     info: VideoInfo
     decode_errors: int
 
-    def iter_raw(self) -> Iterator[_RawFrame]: ...
+    def iter_raw(self, seek_pts: int | None = None) -> Iterator[_RawFrame]: ...
 
     def close(self) -> None: ...
 
@@ -339,7 +340,10 @@ class _PyAVBackend:
             rotation_deg=rotation,
         )
 
-    def iter_raw(self) -> Iterator[_RawFrame]:
+    def iter_raw(self, seek_pts: int | None = None) -> Iterator[_RawFrame]:
+        if seek_pts is not None:
+            # Positionnement sur l'image clé qui précède ``seek_pts``.
+            self._container.seek(seek_pts, stream=self._stream, backward=True, any_frame=False)
         for packet in self._container.demux(self._stream):
             try:
                 decoded = packet.decode()
@@ -391,7 +395,9 @@ class _OpenCVBackend:
             backend=BACKEND_OPENCV,
         )
 
-    def iter_raw(self) -> Iterator[_RawFrame]:
+    def iter_raw(self, seek_pts: int | None = None) -> Iterator[_RawFrame]:
+        # Pas de pts côté OpenCV : aucun positionnement direct (``seek_pts`` ignoré,
+        # le lecteur n'utilise jamais d'index de frames avec ce backend).
         while True:
             ok, image = self._cap.read()
             if not ok or image is None:
@@ -432,6 +438,66 @@ def probe_video(path: Path, cfg: VideoIOConfig) -> VideoInfo:
 
 
 # ---------------------------------------------------------------------------
+# Index des frames (accès direct)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class FrameIndex:
+    """Horodatages (pts) de toutes les frames, dans l'ordre de présentation.
+
+    L'indice d'une frame est son rang dans cette liste : il est identique quel
+    que soit le point de départ du décodage, ce qui permet de traiter des
+    tronçons d'une même vidéo dans des processus séparés (positionnement direct
+    sur l'image clé précédente) sans changer la numérotation.
+    """
+
+    pts: tuple[int, ...]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "_rank", {p: i for i, p in enumerate(self.pts)})
+
+    def __len__(self) -> int:
+        return len(self.pts)
+
+    def __reduce__(self) -> tuple[type[FrameIndex], tuple[tuple[int, ...]]]:
+        # Seuls les pts sont transmis aux processus de travail ; le dictionnaire des
+        # rangs est reconstruit à la réception.
+        return (FrameIndex, (self.pts,))
+
+    def index_of(self, pts: int | None) -> int | None:
+        if pts is None:
+            return None
+        rank: dict[int, int] = object.__getattribute__(self, "_rank")
+        return rank.get(pts)
+
+
+def scan_frame_index(path: Path) -> FrameIndex | None:
+    """Lit les paquets (sans décodage, très rapide) et renvoie l'index des frames.
+
+    ``None`` si le conteneur ne fournit pas de pts exploitables (ou si PyAV ne
+    peut pas l'ouvrir) : l'appelant revient alors à un décodage séquentiel.
+    """
+    try:
+        with av.open(str(path), mode="r") as container:
+            if not container.streams.video:
+                return None
+            stream = container.streams.video[0]
+            values: list[int] = []
+            for packet in container.demux(stream):
+                if packet.size == 0:
+                    continue  # paquet de vidage
+                if packet.pts is None:
+                    return None
+                values.append(int(packet.pts))
+    except (av.error.FFmpegError, OSError, ValueError) as exc:
+        logger.debug("Index des frames indisponible pour %s : %s", path, exc)
+        return None
+    ordered = tuple(sorted(set(values)))
+    return FrameIndex(ordered) if ordered else None
+
+
+# ---------------------------------------------------------------------------
 # Lecteur
 # ---------------------------------------------------------------------------
 
@@ -450,6 +516,11 @@ class VideoReader:
     restent stables quel que soit ``frame_step``/``max_fps``. Si le flux est
     endommagé, des frames peuvent manquer sans trou dans les indices ; l'instant
     de présentation fiable est alors ``time_s`` (issu des pts).
+
+    Avec un :class:`FrameIndex` (``frame_index``), l'indice est le rang du pts dans
+    l'index : il ne dépend plus du point de départ, et ``frames(start_index=…)``
+    se positionne directement sur l'image clé précédente au lieu de tout décoder
+    depuis le début (traitement par tronçons dans des processus séparés).
     """
 
     def __init__(
@@ -458,6 +529,7 @@ class VideoReader:
         video_cfg: VideoIOConfig,
         preprocess_cfg: PreprocessConfig,
         cancel: CancellationToken | None = None,
+        frame_index: FrameIndex | None = None,
     ) -> None:
         self.path = Path(path)
         if not self.path.is_file():
@@ -470,8 +542,12 @@ class VideoReader:
         backend = _open_backend(self.path, video_cfg, probe=True)
         try:
             self.info = backend.info
+            if frame_index is not None and not isinstance(backend, _PyAVBackend):
+                logger.warning("%s : index des frames ignoré (backend sans pts)", self.path.name)
+                frame_index = None
         finally:
             backend.close()
+        self.frame_index = frame_index
         self.decode_errors = 0
         self.frames_decoded = 0
 
@@ -505,8 +581,11 @@ class VideoReader:
         * ``wanted`` : seules ces frames sont converties et renvoyées (les autres
           sont décodées puis ignorées, les indices restent ceux du flux complet).
 
-        Chaque appel relit la vidéo depuis le début (décodage séquentiel exact,
-        indépendant de la précision du seek du conteneur).
+        Sans index de frames, chaque appel relit la vidéo depuis le début (décodage
+        séquentiel exact, indépendant de la précision du seek du conteneur). Avec un
+        index, le décodage commence à l'image clé qui précède la frame
+        ``start_index - 1`` : la décimation (créneaux temporels) est ainsi reprise
+        dans le même état qu'en lecture séquentielle.
         """
         if start_index < 0:
             raise ValueError("start_index doit être ≥ 0")
@@ -517,6 +596,10 @@ class VideoReader:
         self._backend = backend
         self.decode_errors = 0
         self.frames_decoded = 0
+        index_map = self.frame_index if isinstance(backend, _PyAVBackend) else None
+        seek_pts: int | None = None
+        if index_map is not None and 0 < start_index <= len(index_map):
+            seek_pts = index_map.pts[start_index - 1]
         step = self._video_cfg.frame_step
         fps = backend.info.fps if backend.info.fps > 0 else 0.0
         max_fps = self._video_cfg.max_fps
@@ -525,26 +608,38 @@ class VideoReader:
             # 60 i/s → 15, 30 → 15, 25 ou 24 → inchangé (pas d'échantillonnage irrégulier).
             max_fps = fps / max(1, int(fps / max_fps + 1e-6))
         last_bucket: int | None = None
+        unknown_pts = 0
         try:
-            for index, raw in enumerate(backend.iter_raw()):
-                self.frames_decoded = index + 1
+            for rank, raw in enumerate(backend.iter_raw(seek_pts)):
+                self.frames_decoded = rank + 1
                 self.decode_errors = backend.decode_errors
                 if self._cancel is not None:
                     self._cancel.raise_if_cancelled()
+                if index_map is None:
+                    index = rank
+                else:
+                    found = index_map.index_of(raw.pts)
+                    if found is None:
+                        unknown_pts += 1
+                        continue
+                    index = found
                 if stop_index is not None and index >= stop_index:
                     break
-                if index < start_index or (index - start_index) % step != 0:
+                if (index - start_index) % step != 0:
                     continue
                 time_s = raw.time_s
                 if time_s is None:
                     time_s = index / fps if fps > 0 else float(index)
                 if max_fps > 0.0:
                     # Au plus une frame par créneau de 1/max_fps s. La tolérance absorbe
-                    # l'arrondi des pts (ex. intervalles de 16/17 ms à 60 i/s).
+                    # l'arrondi des pts (ex. intervalles de 16/17 ms à 60 i/s). Les frames
+                    # qui précèdent ``start_index`` mettent à jour le créneau courant.
                     bucket = math.floor(time_s * max_fps + _BUCKET_TOLERANCE)
                     if last_bucket is not None and bucket <= last_bucket:
                         continue
                     last_bucket = bucket
+                if index < start_index:
+                    continue
                 if wanted is not None and index not in wanted:
                     continue
                 if proxy_only:
@@ -554,6 +649,9 @@ class VideoReader:
                 yield self._make_obs(index, time_s, raw.pts, image, compute_proxy)
         finally:
             self.decode_errors = backend.decode_errors
+            if unknown_pts:
+                logger.warning("%s : %d frame(s) décodée(s) absente(s) de l'index, ignorée(s)",
+                               self.path.name, unknown_pts)
             self.close()
 
     def _apply_rotation(self, image: ImageU8, rotation_deg: int) -> ImageU8:

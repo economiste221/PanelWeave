@@ -525,7 +525,23 @@ class RuntimeConfig:
         0,
         minimum=0,
         maximum=256,
-        help="Processus de traitement par lot (0 = nombre de cœurs performance).",
+        help="Processus de calcul : tronçons, séquences et vidéos d'un lot sont répartis "
+        "sur ce nombre de processus (0 = nombre de cœurs performance).",
+    )
+    chunk_seconds: float = param(
+        300.0,
+        minimum=0.0,
+        maximum=86400.0,
+        help="Durée maximale d'un tronçon de découpage : une longue vidéo est découpée en "
+        "tronçons traités par des processus séparés, puis raccordés aux frontières qui "
+        "montrent le même panel (0 = jamais de tronçons).",
+    )
+    min_chunk_seconds: float = param(
+        30.0,
+        minimum=0.1,
+        maximum=86400.0,
+        help="Durée minimale d'un tronçon : en dessous, une vidéo n'est pas découpée "
+        "davantage pour occuper tous les processus.",
     )
     log_level: str = param(
         "INFO", choices=("DEBUG", "INFO", "WARNING", "ERROR"), help="Niveau de journalisation."

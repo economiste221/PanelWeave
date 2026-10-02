@@ -52,3 +52,22 @@ def decoded_index(image: ImageU8) -> int:
     h, w = image.shape[:2]
     region = image[h // 2 :, w // 2 :]
     return int(round((float(region.mean()) - 20.0) / 9.0))
+
+
+def write_keyframed_video(path: Path, frames: Iterable[ImageU8], fps: int, gop: int) -> Path:
+    """Encode en H.264 avec une image clé toutes les ``gop`` frames et des images B
+    (réordonnancement des pts) : sert à tester le positionnement direct."""
+    import av
+
+    frame_list = list(frames)
+    h, w = frame_list[0].shape[:2]
+    with av.open(str(path), mode="w") as container:
+        stream = container.add_stream("libx264", rate=fps,
+                                      options={"crf": "12", "g": str(gop), "keyint_min": str(gop),
+                                               "bf": "2", "sc_threshold": "0"})
+        stream.width, stream.height, stream.pix_fmt = w, h, "yuv420p"
+        for image in frame_list:
+            frame = av.VideoFrame.from_ndarray(image, format="bgr24")
+            container.mux(stream.encode(frame))
+        container.mux(stream.encode(None))
+    return path

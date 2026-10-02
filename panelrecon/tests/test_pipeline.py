@@ -24,7 +24,8 @@ from panelrecon.core.models import (
     SimilarityTransform,
 )
 from panelrecon.core.mosaic import build_mosaic
-from panelrecon.core.pipeline import process_video
+from panelrecon.core.pipeline import plan_chunks, process_video
+from panelrecon.core.scene_split import SequenceRegistration, SplitResult, concatenate_splits
 from panelrecon.tests.conftest import RegistrationCache, SyntheticCache
 
 
@@ -139,3 +140,75 @@ def test_cli_reconstruct(synthetic: SyntheticCache, corrupt_mp4: Path, tmp_path:
     assert report["n_ok"] == 1 and report["n_failed"] == 1
     assert (out / "short" / "short_seq000_000000-000003.png").is_file()
     assert cli.main(["-i", str(gt.video_path), "-o", str(tmp_path / "ok")]) == cli.EXIT_OK
+
+
+# ------------------------------------------------------------------ tronçons
+
+
+def test_plan_chunks() -> None:
+    cfg = PipelineConfig()
+    # 1 h à 30 i/s, tronçons de 5 min : 12 tronçons contigus.
+    chunks = plan_chunks(108000, 30.0, cfg, 8)
+    assert len(chunks) == 12 and chunks[0][0] == 0 and chunks[-1][1] == 108000
+    assert all(a[1] == b[0] for a, b in zip(chunks[:-1], chunks[1:], strict=True))
+    # 3 min : réparties sur les processus (tronçons d'au moins 30 s).
+    assert len(plan_chunks(5400, 30.0, cfg, 8)) == 6
+    assert plan_chunks(5400, 30.0, cfg, 1) == [(0, 5400)]
+    cfg.runtime.chunk_seconds = 0.0
+    assert plan_chunks(108000, 30.0, cfg, 8) == [(0, 108000)]
+    assert plan_chunks(0, 30.0, cfg, 8) == []
+
+
+def _chunked_config() -> PipelineConfig:
+    cfg = PipelineConfig()
+    cfg.runtime.num_workers = 2
+    cfg.runtime.chunk_seconds = 0.4  # 10 frames à 25 i/s
+    cfg.runtime.min_chunk_seconds = 0.4
+    return cfg
+
+
+def test_chunked_split_stitches_same_panel(synthetic: SyntheticCache, tmp_path: Path) -> None:
+    """Panoramique découpé en 3 tronçons (processus séparés) : les frontières montrent
+    le même panel, les morceaux sont réunis en une seule séquence conforme."""
+    gt = synthetic.get("pan_horizontal")
+    outcome = process_video(gt.video_path, tmp_path, _chunked_config())
+    assert outcome.ok and outcome.chunks == 3 and outcome.workers == 2
+    assert outcome.split is not None and outcome.split.transitions == []
+    (seq,) = outcome.sequences
+    assert (seq.sequence.start_idx, seq.sequence.end_idx) == (0, 29) and seq.frames_used == 30
+    assert seq.files is not None
+    report = json.loads(seq.files.report.read_text(encoding="utf-8"))
+    result = _result_from_files(seq.files.image, seq.files.coverage, report)
+    assert evaluate_mosaic(result, gt, 0).check(ReferenceThresholds()) == []
+
+
+def test_chunked_split_keeps_transitions(synthetic: SyntheticCache, tmp_path: Path) -> None:
+    """Deux panels, 5 tronçons : mêmes séquences et même fondu qu'en lecture continue."""
+    gt = synthetic.get("crossfade")
+    outcome = process_video(gt.video_path, tmp_path, _chunked_config())
+    assert outcome.ok and outcome.chunks == 5
+    assert [(s.sequence.start_idx, s.sequence.end_idx) for s in outcome.sequences] == [
+        (shot.start_idx, shot.end_idx) for shot in gt.shots]
+    assert outcome.split is not None
+    (transition,) = outcome.split.transitions
+    assert transition.kind == "dissolve" and len(transition.excluded) == 6
+    for k, seq in enumerate(outcome.sequences):
+        assert seq.files is not None
+        report = json.loads(seq.files.report.read_text(encoding="utf-8"))
+        result = _result_from_files(seq.files.image, seq.files.coverage, report)
+        assert evaluate_mosaic(result, gt, k).check(ReferenceThresholds()) == []
+
+
+def test_concatenate_splits_without_link_records_a_cut(registered: RegistrationCache) -> None:
+    gt_a = registered.synthetic.get("crossfade")
+    first = registered.get("crossfade", 0)
+    second = registered.get("crossfade", 1)
+    a = SplitResult([SequenceRegistration(Sequence(gt_a.shots[0].start_idx,
+                                                   gt_a.shots[0].end_idx), first)], frames_seen=20)
+    b = SplitResult([SequenceRegistration(Sequence(gt_a.shots[1].start_idx,
+                                                   gt_a.shots[1].end_idx), second)], frames_seen=20)
+    merged = concatenate_splits(a, b, None, "frontière de tronçon")
+    assert len(merged.sequences) == 2 and merged.frames_seen == 40
+    (cut,) = merged.transitions
+    assert cut.kind == "cut" and cut.first_after == gt_a.shots[1].start_idx
+    assert concatenate_splits(SplitResult(), b, None, "x").transitions == []

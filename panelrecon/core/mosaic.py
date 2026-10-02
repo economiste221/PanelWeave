@@ -36,6 +36,7 @@ from numpy.typing import NDArray
 
 from panelrecon.core.config import PipelineConfig
 from panelrecon.core.hardware import resolve_num_workers
+from panelrecon.core.parallel import worker_threads
 from panelrecon.core.geometry import FULL_COVERAGE_ALPHA, corners, to_u8
 from panelrecon.core.models import (
     CancellationToken,
@@ -363,7 +364,7 @@ def build_mosaic(
             raise ValueError(f"Frames recalées absentes du flux : {sorted(missing)[:10]}")
 
         fused, coverage = _fuse_tiles(obs.data, scale_w, cfg.tile_size, cancel, progress,
-                                      resolve_num_workers(config.runtime.num_workers))
+                                      worker_threads(resolve_num_workers(config.runtime.num_workers)))
 
     covered = coverage >= cfg.min_coverage
     if not covered.any():

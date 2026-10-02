@@ -416,3 +416,48 @@ def register_frames(
         result.canonical_scale,
     )
     return result
+
+
+def merge_registrations(
+    first: RegistrationResult,
+    second: RegistrationResult,
+    link: SimilarityTransform,
+    link_estimate: MotionEstimate,
+) -> RegistrationResult:
+    """Réunit deux recalages d'un même panel (séquence coupée à une frontière de
+    tronçon) en un seul, dans le repère de référence de ``first``.
+
+    ``link`` envoie les coordonnées natives de la première frame de ``second``
+    vers celles de la dernière frame de ``first``.
+    """
+    last_a, first_b = max(first.transforms), min(second.transforms)
+    if first_b <= last_a:
+        raise ValueError(f"Recalages qui se chevauchent : {first_b} ≤ {last_a}")
+    # Poses vers la frame de référence de chaque morceau (repère canonique retiré).
+    pose_a = {i: SimilarityTransform(scale=1.0 / first.canonical_scale) @ t
+              for i, t in first.transforms.items()}
+    pose_b = {i: SimilarityTransform(scale=1.0 / second.canonical_scale) @ t
+              for i, t in second.transforms.items()}
+    b_to_a = pose_a[last_a] @ link @ pose_b[first_b].inverse()
+    poses = dict(pose_a)
+    poses.update({i: b_to_a @ t for i, t in pose_b.items()})
+    finest = min(t.scale for t in poses.values())
+    canonical = SimilarityTransform(scale=1.0 / finest)
+    rms: tuple[float, float] | None = None
+    if first.adjustment_rms_px is not None or second.adjustment_rms_px is not None:
+        values = [r for r in (first.adjustment_rms_px, second.adjustment_rms_px) if r is not None]
+        rms = (max(r[0] for r in values), max(r[1] for r in values))  # pire des morceaux
+    return RegistrationResult(
+        transforms={i: canonical @ t for i, t in poses.items()},
+        estimates=[*first.estimates, link_estimate, *second.estimates],
+        rejected=[*first.rejected, *second.rejected],
+        excluded=sorted(set(first.excluded) | set(second.excluded)),
+        reference_index=first.reference_index,
+        canonical_scale=1.0 / finest,
+        interrupted=first.interrupted or second.interrupted,
+        interruption_reason="; ".join(r for r in (first.interruption_reason,
+                                                  second.interruption_reason) if r),
+        frame_sizes={**first.frame_sizes, **second.frame_sizes},
+        n_links=first.n_links + second.n_links,
+        adjustment_rms_px=rms,
+    )
