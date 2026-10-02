@@ -18,11 +18,15 @@ ajoutés en phase 6.
 from __future__ import annotations
 
 import logging
+import math
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 
 import cv2
 import numpy as np
+from numpy.typing import NDArray
+from scipy.optimize import least_squares
+from scipy.sparse import lil_matrix
 
 from panelrecon.core.config import PipelineConfig
 from panelrecon.core.models import (
@@ -41,6 +45,17 @@ PanelMaskProvider = Callable[[FrameObs], MaskU8 | None]
 """Fournit le masque natif du panel d'une frame (``None`` = toute la frame)."""
 
 
+@dataclass(frozen=True)
+class PoseEdge:
+    """Mesure relative entre deux frames : ``transform`` envoie les coordonnées
+    natives de ``src`` vers celles de ``dst`` ; ``weight`` ∈ ]0, 1] (confiance)."""
+
+    src: int
+    dst: int
+    transform: SimilarityTransform
+    weight: float
+
+
 @dataclass
 class RegistrationResult:
     """Résultat du recalage d'une séquence.
@@ -57,6 +72,8 @@ class RegistrationResult:
     interrupted: bool = False
     interruption_reason: str = ""
     frame_sizes: dict[int, tuple[int, int]] = field(default_factory=dict)
+    n_links: int = 0  # liens directs entre images clés (anti-dérive)
+    adjustment_rms_px: tuple[float, float] | None = None  # résidu avant / après ajustement
 
     @property
     def registered_indices(self) -> list[int]:
@@ -126,6 +143,10 @@ class ChainRegistrar:
         self._interrupted = False
         self._reason = ""
         self._reference_index: int | None = None
+        self._edges: list[PoseEdge] = []
+        self._keyframes: list[MotionFrame] = []
+        self._accepted = 0
+        self._n_links = 0
 
     @property
     def interrupted(self) -> bool:
@@ -158,6 +179,7 @@ class ChainRegistrar:
             self._reference_index = frame.index
             self._to_reference[frame.index] = SimilarityTransform.identity()
             self._sizes[frame.index] = native_size
+            self._keyframes.append(frame)
             return None
         if frame.index <= self._anchor.index:
             raise ValueError(f"Indices non croissants : {frame.index} après {self._anchor.index}")
@@ -185,17 +207,68 @@ class ChainRegistrar:
         self._to_reference[frame.index] = self._to_reference[self._anchor.index] @ native
         self._sizes[frame.index] = native_size
         self._estimates.append(estimate)
+        self._edges.append(PoseEdge(frame.index, self._anchor.index, native,
+                                    _edge_weight(estimate)))
         self._anchor = frame
+        self._accepted += 1
+        reg_cfg = self.config.registration
+        if reg_cfg.global_adjustment and self._accepted % reg_cfg.keyframe_interval == 0:
+            self._add_keyframe(frame)
         return estimate
+
+    # --------------------------------------------------------------- images clés
+    def _predicted_overlap(self, src: int, dst: int) -> float:
+        """Part de la frame ``src`` qui retombe dans ``dst`` d'après les poses actuelles."""
+        src_to_dst = self._to_reference[dst].inverse() @ self._to_reference[src]
+        w, h = self._sizes[src]
+        dw, dh = self._sizes[dst]
+        quad = src_to_dst.apply(_corners(w, h))
+        x0, y0 = np.maximum(quad.min(axis=0), 0.0)
+        x1, y1 = np.minimum(quad.max(axis=0), (dw - 1.0, dh - 1.0))
+        inter = max(0.0, x1 - x0) * max(0.0, y1 - y0)
+        area = float(np.ptp(quad[:, 0]) * np.ptp(quad[:, 1]))
+        return inter / area if area > 0 else 0.0
+
+    def _add_keyframe(self, frame: MotionFrame) -> None:
+        """Lie directement la nouvelle image clé à des images clés antérieures qui la
+        recouvrent encore (la plus ancienne d'abord : c'est elle qui borne la dérive)."""
+        reg_cfg = self.config.registration
+        previous = self._keyframes[:-1] if len(self._keyframes) > 1 else []
+        candidates = [k for k in previous
+                      if self._predicted_overlap(frame.index, k.index) >= reg_cfg.link_min_overlap]
+        chosen: list[MotionFrame] = []
+        if candidates and reg_cfg.links_per_keyframe > 0:
+            picks = np.linspace(0, len(candidates) - 1, reg_cfg.links_per_keyframe)
+            for pos in sorted({int(round(p)) for p in picks}):
+                chosen.append(candidates[pos])
+        for keyframe in chosen:
+            estimate = self.estimator.estimate(frame, keyframe)
+            if estimate.accepted:
+                self._edges.append(PoseEdge(frame.index, keyframe.index,
+                                            to_native(estimate, frame, keyframe),
+                                            _edge_weight(estimate)))
+                self._n_links += 1
+        self._keyframes.append(frame)
+        for keyframe in self._keyframes:  # libère les caches volumineux
+            keyframe._gradient = None
+        if len(self._keyframes) > reg_cfg.max_keyframes:
+            # Garde la plus ancienne (ancrage à longue portée) et une sur deux ensuite.
+            self._keyframes = [self._keyframes[0]] + self._keyframes[2::2]
 
     def result(self) -> RegistrationResult:
         if self._reference_index is None:
             raise ValueError("Aucune frame recalée")
+        poses = dict(self._to_reference)
+        rms: tuple[float, float] | None = None
+        reg_cfg = self.config.registration
+        if reg_cfg.global_adjustment and self._n_links > 0:
+            poses, rms = adjust_poses(poses, self._edges, self._sizes, self._reference_index,
+                                      reg_cfg.huber_px, reg_cfg.rotation_prior_weight)
         # Taille, dans le repère de référence, d'un pixel de chaque frame : la frame la
         # plus zoomée a le plus petit pixel ; le canevas est mis à son échelle.
-        finest = min(t.scale for t in self._to_reference.values())
+        finest = min(t.scale for t in poses.values())
         canonical = SimilarityTransform(scale=1.0 / finest)
-        transforms = {i: canonical @ t for i, t in self._to_reference.items()}
+        transforms = {i: canonical @ t for i, t in poses.items()}
         return RegistrationResult(
             transforms=transforms,
             estimates=list(self._estimates),
@@ -206,7 +279,118 @@ class ChainRegistrar:
             interrupted=self._interrupted,
             interruption_reason=self._reason,
             frame_sizes=dict(self._sizes),
+            n_links=self._n_links,
+            adjustment_rms_px=rms,
         )
+
+
+def _corners(width: int, height: int) -> NDArray[np.float64]:
+    return np.array([[0.0, 0.0], [width - 1.0, 0.0], [width - 1.0, height - 1.0],
+                     [0.0, height - 1.0]])
+
+
+def _sample_points(width: int, height: int) -> NDArray[np.float64]:
+    return np.vstack([_corners(width, height), [[(width - 1) / 2.0, (height - 1) / 2.0]]])
+
+
+def _edge_weight(estimate: MotionEstimate) -> float:
+    """Confiance d'une mesure : nombre d'inliers (saturé) et cohérence structurelle."""
+    support = min(1.0, estimate.n_inliers / 100.0) if estimate.n_inliers else 0.5
+    coherence = estimate.ncc if estimate.ncc is not None else 0.9
+    return float(np.clip(support * max(coherence, 0.0), 0.05, 1.0))
+
+
+def adjust_poses(
+    poses: dict[int, SimilarityTransform],
+    edges: list[PoseEdge],
+    sizes: dict[int, tuple[int, int]],
+    reference: int,
+    huber_px: float,
+    rotation_weight: float,
+) -> tuple[dict[int, SimilarityTransform], tuple[float, float]]:
+    """Ajustement global d'un graphe de poses (``frame → référence``, natif).
+
+    Pour chaque mesure ``i → j`` (``M``), le résidu est l'écart, en pixels du
+    repère de référence, entre ``P_j(M(p))`` et ``P_i(p)`` aux coins et au centre de
+    la frame ``i``, pondéré par la confiance. Inconnues par frame : log-échelle,
+    rotation, translation ; la référence est fixe. Perte de Huber (``huber_px``)
+    et rappel de la rotation vers 0 (``rotation_weight``). En cas d'échec ou de
+    dégradation, les poses initiales sont conservées.
+    """
+    ids = [i for i in sorted(poses) if i != reference]
+    if not ids or not edges:
+        return poses, (0.0, 0.0)
+    col = {i: k for k, i in enumerate(ids)}
+    x0 = np.array([[math.log(poses[i].scale), poses[i].theta, poses[i].tx, poses[i].ty]
+                   for i in ids], dtype=np.float64).ravel()
+    ref_pose = poses[reference]
+    ref_params = np.array([math.log(ref_pose.scale), ref_pose.theta, ref_pose.tx, ref_pose.ty])
+
+    src_pts = np.stack([_sample_points(*sizes[e.src]) for e in edges])        # (E, 5, 2)
+    dst_pts = np.stack([e.transform.apply(p) for e, p in zip(edges, src_pts)])  # M(p)
+    weights = np.array([e.weight for e in edges])[:, None, None]
+    src_col = np.array([col.get(e.src, -1) for e in edges])
+    dst_col = np.array([col.get(e.dst, -1) for e in edges])
+    half_diag = np.array([0.5 * math.hypot(*sizes[i]) for i in ids])
+    prior = math.sqrt(rotation_weight)
+
+    def params_of(x: NDArray[np.float64], cols: NDArray[np.int64]) -> NDArray[np.float64]:
+        table = x.reshape(-1, 4)
+        out = np.empty((len(cols), 4))
+        known = cols >= 0
+        out[known] = table[cols[known]]
+        out[~known] = ref_params
+        return out
+
+    def apply(params: NDArray[np.float64], pts: NDArray[np.float64]) -> NDArray[np.float64]:
+        s = np.exp(params[:, 0])[:, None]
+        c = s * np.cos(params[:, 1])[:, None]
+        sn = s * np.sin(params[:, 1])[:, None]
+        x, y = pts[..., 0], pts[..., 1]
+        return np.stack([c * x - sn * y + params[:, 2:3], sn * x + c * y + params[:, 3:4]],
+                        axis=-1)
+
+    def residuals(x: NDArray[np.float64]) -> NDArray[np.float64]:
+        moved_dst = apply(params_of(x, dst_col), dst_pts)
+        moved_src = apply(params_of(x, src_col), src_pts)
+        r = ((moved_dst - moved_src) * weights).ravel()
+        thetas = x.reshape(-1, 4)[:, 1]
+        return np.concatenate([r, prior * thetas * half_diag])
+
+    n_rows = len(edges) * 10 + len(ids)
+    sparsity = lil_matrix((n_rows, 4 * len(ids)), dtype=np.int8)
+    for e_idx in range(len(edges)):
+        rows = slice(e_idx * 10, e_idx * 10 + 10)
+        for c in (src_col[e_idx], dst_col[e_idx]):
+            if c >= 0:
+                sparsity[rows, 4 * c : 4 * c + 4] = 1
+    for k in range(len(ids)):
+        sparsity[len(edges) * 10 + k, 4 * k + 1] = 1
+
+    def rms(x: NDArray[np.float64]) -> float:
+        r = residuals(x)[: len(edges) * 10].reshape(-1, 2)
+        return float(np.sqrt(np.mean(np.sum(r * r, axis=1))))
+
+    before = rms(x0)
+    try:
+        solution = least_squares(residuals, x0, jac_sparsity=sparsity, loss="huber",
+                                 f_scale=huber_px, x_scale="jac", method="trf", max_nfev=200)
+    except (ValueError, np.linalg.LinAlgError) as exc:
+        logger.warning("Ajustement global impossible (%s) : poses du chaînage conservées", exc)
+        return poses, (before, before)
+    after = rms(solution.x)
+    if not np.all(np.isfinite(solution.x)) or after > before:
+        logger.warning("Ajustement global non concluant (%.3f → %.3f px) : poses conservées",
+                       before, after)
+        return poses, (before, before)
+    table = solution.x.reshape(-1, 4)
+    adjusted = {reference: poses[reference]}
+    for i, k in col.items():
+        adjusted[i] = SimilarityTransform(float(math.exp(table[k, 0])), float(table[k, 1]),
+                                          float(table[k, 2]), float(table[k, 3]))
+    logger.info("Ajustement global : %d frames, %d mesures, résidu %.3f → %.3f px",
+                len(ids) + 1, len(edges), before, after)
+    return adjusted, (before, after)
 
 
 def register_frames(

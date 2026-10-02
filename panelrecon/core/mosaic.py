@@ -23,6 +23,7 @@ from __future__ import annotations
 import logging
 import math
 import tempfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections.abc import Callable, Iterable
 from contextlib import ExitStack
 from dataclasses import dataclass
@@ -34,6 +35,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from panelrecon.core.config import PipelineConfig
+from panelrecon.core.hardware import resolve_num_workers
 from panelrecon.core.geometry import FULL_COVERAGE_ALPHA, corners, to_u8
 from panelrecon.core.models import (
     CancellationToken,
@@ -184,27 +186,43 @@ def weighted_median(
 ) -> NDArray[np.float32]:
     """Médiane pondérée selon l'axe 0, par canal.
 
-    ``values`` : ``(n, h, w, c)`` ; ``weights`` : ``(n, h, w)`` (0 = observation
+    ``values`` : ``(n, h, w, c)`` uint8 ; ``weights`` : ``(n, h, w)`` (0 = observation
     invalide). Quand la demi-masse tombe exactement entre deux observations, la
     moyenne des deux est renvoyée (à poids égaux, c'est la médiane usuelle).
     Renvoie ``NaN`` là où le poids total est nul.
+
+    Les valeurs étant des entiers de 0 à 255, la médiane est cherchée par
+    dichotomie sur la valeur (8 étapes) à partir de la masse cumulée
+    ``Σ w·[x ≤ v]`` : aucun tri ni réindexation, ce qui est plusieurs fois plus
+    rapide qu'un tri par pixel pour un résultat identique (aux égalités exactes
+    de demi-masse près, tranchées par l'arrondi flottant).
     """
-    n, h, w, c = values.shape
-    v = values.astype(np.float32)
-    invalid = weights <= 0
-    v[np.broadcast_to(invalid[..., None], v.shape)] = np.inf
-    order = np.argsort(v, axis=0, kind="stable")
-    sorted_v = np.take_along_axis(v, order, axis=0)
-    sorted_w = np.take_along_axis(np.broadcast_to(weights[..., None], v.shape), order, axis=0)
-    cumulative = np.cumsum(sorted_w, axis=0)
-    total = cumulative[-1]
+    _, h, w, c = values.shape
+    stacked_w = weights[..., None].astype(np.float32)
+    total = weights.sum(axis=0, dtype=np.float32)[..., None]
     half = 0.5 * total
     tol = 1e-6 * total
-    lo = np.argmax(cumulative >= half - tol, axis=0)[None]
-    hi = np.argmax(cumulative > half + tol, axis=0)[None]
-    v_lo = np.take_along_axis(sorted_v, lo, axis=0)[0]
-    v_hi = np.take_along_axis(sorted_v, hi, axis=0)[0]
-    out = 0.5 * (v_lo + v_hi)
+
+    def mass_below(level: NDArray[np.int16]) -> NDArray[np.float32]:
+        below = (values <= level.astype(np.uint8)[None]).astype(np.float32)
+        return np.asarray(np.einsum("nhwc,nhwk->hwc", below, stacked_w), dtype=np.float32)
+
+    # Plus petite valeur dont la masse cumulée atteint la moitié.
+    lo: NDArray[np.int16] = np.zeros((h, w, c), np.int16)
+    hi: NDArray[np.int16] = np.full((h, w, c), 255, np.int16)
+    for _ in range(8):
+        mid = ((lo + hi) >> 1).astype(np.int16)
+        ok = mass_below(mid) >= half - tol
+        hi = np.where(ok, mid, hi).astype(np.int16)
+        lo = np.where(ok, lo, mid + 1).astype(np.int16)
+    lower = lo
+    # Égalité exacte de demi-masse : la médiane est la moyenne avec la valeur
+    # observée suivante (une seule passe, uniquement utile sur ces pixels).
+    tie = mass_below(lower) <= half + tol
+    valid = (weights > 0)[..., None]
+    above = np.where(valid & (values > lower.astype(np.uint8)[None]), values, 255).min(axis=0)
+    upper = np.where(tie, above.astype(np.int16), lower)
+    out = 0.5 * (lower.astype(np.float32) + upper.astype(np.float32))
     return np.where(total > 0, out, np.nan).astype(np.float32)
 
 
@@ -328,7 +346,8 @@ def build_mosaic(
         if missing:
             raise ValueError(f"Frames recalées absentes du flux : {sorted(missing)[:10]}")
 
-        fused, coverage = _fuse_tiles(obs.data, scale_w, cfg.tile_size, cancel, progress)
+        fused, coverage = _fuse_tiles(obs.data, scale_w, cfg.tile_size, cancel, progress,
+                                      resolve_num_workers(config.runtime.num_workers))
 
     covered = coverage >= cfg.min_coverage
     if not covered.any():
@@ -461,23 +480,37 @@ def _fuse_tiles(
     tile: int,
     cancel: CancellationToken | None,
     progress: ProgressCallback | None,
+    workers: int = 1,
 ) -> tuple[NDArray[np.float32], NDArray[np.uint16]]:
+    """Fusion par tuiles indépendantes, réparties sur ``workers`` threads (NumPy et
+    OpenCV libèrent le GIL sur ces calculs ; la mémoire reste bornée par tuile)."""
     n, height, width, _ = stack.shape
     fused = np.full((height, width, 3), np.nan, dtype=np.float32)
     coverage = np.zeros((height, width), dtype=np.uint16)
     tiles = [(y, x) for y in range(0, height, tile) for x in range(0, width, tile)]
-    for k, (y, x) in enumerate(tiles):
-        if cancel is not None:
-            cancel.raise_if_cancelled()
+
+    def fuse(y: int, x: int) -> None:
         block = np.asarray(stack[:, y : y + tile, x : x + tile])
         edge = block[..., 3]
         present = edge.reshape(n, -1).any(axis=1)
         if not present.any():
-            continue
+            return
         block, edge = block[present], edge[present]
         weights = edge.astype(np.float32) / 255.0 * scale_w[present][:, None, None]
         fused[y : y + tile, x : x + tile] = weighted_median(block[..., :3], weights)
         coverage[y : y + tile, x : x + tile] = (edge > 0).sum(axis=0).astype(np.uint16)
-        if progress is not None:
-            progress(0.7 + 0.3 * (k + 1) / len(tiles), "fusion")
+
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+        futures = [pool.submit(fuse, y, x) for y, x in tiles]
+        try:
+            for done, future in enumerate(as_completed(futures), start=1):
+                future.result()
+                if cancel is not None:
+                    cancel.raise_if_cancelled()
+                if progress is not None:
+                    progress(0.7 + 0.3 * done / len(tiles), "fusion")
+        except BaseException:
+            for future in futures:
+                future.cancel()
+            raise
     return fused, coverage

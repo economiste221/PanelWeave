@@ -68,7 +68,10 @@ def stretch_contrast(
         samples = np.concatenate([samples, reference[mask > 0] if mask is not None else reference.ravel()])
     if samples.size == 0:
         return image
-    lo, hi = np.percentile(samples, _STRETCH_PERCENTILES)
+    # Percentiles exacts sur des niveaux 8 bits via l'histogramme (pas de tri).
+    cdf = np.cumsum(np.bincount(samples.ravel(), minlength=256))
+    lo = float(np.searchsorted(cdf, cdf[-1] * _STRETCH_PERCENTILES[0] / 100.0))
+    hi = float(np.searchsorted(cdf, cdf[-1] * _STRETCH_PERCENTILES[1] / 100.0))
     if hi - lo < 1.0:
         return image
     lut = np.clip((np.arange(256, dtype=np.float32) - lo) * (255.0 / (hi - lo)), 0, 255)
@@ -94,6 +97,7 @@ class MotionFrame:
     mask: MaskU8 | None = None
     factor: float = 1.0
     _features: dict[str, Features] = field(default_factory=dict, repr=False)
+    _gradient: NDArray[np.float32] | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         if self.gray.ndim != 2 or self.gray.dtype != np.uint8:
@@ -106,6 +110,12 @@ class MotionFrame:
     @property
     def size(self) -> tuple[int, int]:
         return int(self.gray.shape[1]), int(self.gray.shape[0])
+
+    def gradient(self) -> NDArray[np.float32]:
+        """Norme du gradient (mise en cache : une frame sert à plusieurs comparaisons)."""
+        if self._gradient is None:
+            self._gradient = gradient_magnitude(self.gray)
+        return self._gradient
 
     def valid_mask(self) -> MaskU8:
         if self.mask is None:
@@ -520,8 +530,8 @@ def photometric_consistency(
     structure sont ignorées. Renvoie -1 si aucune tuile n'est exploitable.
     """
     size = dst.size
-    grad_src = gradient_magnitude(src.gray)
-    grad_dst = gradient_magnitude(dst.gray)
+    grad_src = src.gradient()
+    grad_dst = dst.gradient()
     warped = cv2.warpAffine(grad_src, transform.matrix(), size, flags=cv2.INTER_LINEAR)
     overlap = np.asarray(cv2.bitwise_and(dst.valid_mask(), _warp_valid(src, transform, size)),
                          dtype=np.uint8)
@@ -529,7 +539,8 @@ def photometric_consistency(
     ratio = float(overlap_b.mean())
     if not overlap_b.any():
         return -1.0, ratio
-    texture = 0.05 * float(np.percentile(grad_dst[overlap_b], 99))
+    # Seuil de texture : 99e percentile estimé sur un pixel sur 16 (suffisant, bien moins cher).
+    texture = 0.05 * float(np.percentile(grad_dst[overlap_b][::16], 99))
     h, w = overlap_b.shape
     scores: list[float] = []
     for y0 in range(0, h, tile_px):

@@ -243,6 +243,41 @@ class RegistrationConfig:
         maximum=100000,
         help="Échecs d'estimation consécutifs tolérés avant d'interrompre la séquence.",
     )
+    global_adjustment: bool = param(
+        True,
+        help="Ajustement global (graphe de poses, moindres carrés robustes) en fin de séquence.",
+    )
+    keyframe_interval: int = param(
+        6, minimum=1, maximum=10000, help="Une image clé toutes les N frames recalées."
+    )
+    links_per_keyframe: int = param(
+        2,
+        minimum=0,
+        maximum=20,
+        help="Liens directs d'une nouvelle image clé vers des images clés antérieures "
+        "(la plus ancienne qui recouvre encore la frame, puis des intermédiaires).",
+    )
+    link_min_overlap: float = param(
+        0.3,
+        minimum=0.0,
+        maximum=1.0,
+        help="Recouvrement prédit minimal pour tenter un lien entre images clés.",
+    )
+    max_keyframes: int = param(
+        60,
+        minimum=2,
+        maximum=100000,
+        help="Images clés gardées en mémoire par séquence (au-delà, une sur deux est oubliée).",
+    )
+    huber_px: float = param(
+        1.0, minimum=0.01, maximum=100.0, help="Seuil (px natifs) de la perte de Huber."
+    )
+    rotation_prior_weight: float = param(
+        10.0,
+        minimum=0.0,
+        maximum=1e6,
+        help="Poids du rappel de la rotation vers 0 dans l'ajustement global.",
+    )
 
 
 @dataclass

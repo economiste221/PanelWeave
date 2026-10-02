@@ -30,7 +30,8 @@ from __future__ import annotations
 
 import logging
 from collections import deque
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -151,14 +152,16 @@ class SequenceTracker:
         self._finished = False
 
     # ---------------------------------------------------------------- flux
-    def push(self, frame: FrameObs) -> None:
+    def push(self, frame: FrameObs, motion_frame: MotionFrame | None = None) -> None:
+        """Ajoute une frame ; ``motion_frame`` (facultatif) est son entrée d'estimation
+        déjà préparée (voir :func:`prefetch_motion_frames`)."""
         if self._finished:
             raise RuntimeError("Découpage déjà terminé")
         self._result.frames_seen += 1
         small = thumbnail(frame.image, self.cfg.thumbnail_width)
         hist = hsv_histogram(small)
         content_cut = bool(self._detector.process_frame(frame.index, small)) if self._detector else False
-        mf = make_motion_frame(frame, self.config)
+        mf = motion_frame if motion_frame is not None else make_motion_frame(frame, self.config)
         size = (frame.width, frame.height)
         prev, prev_hist = self._prev_frame, self._prev_hist
         self._prev_frame, self._prev_hist = mf, hist
@@ -305,6 +308,39 @@ class SequenceTracker:
             new_registrar.add(frame, size, estimate)
 
 
+def prefetch_motion_frames(
+    frames: Iterable[FrameObs], config: PipelineConfig, depth: int = 2
+) -> Iterator[tuple[FrameObs, MotionFrame]]:
+    """Prépare les frames à venir dans un thread d'arrière-plan : décodage, entrée
+    d'estimation, points d'intérêt et gradients. OpenCV libérant le GIL, ce travail
+    se superpose au recalage de la frame courante dans le thread principal.
+
+    Le thread utilise son propre détecteur (aucun objet OpenCV partagé).
+    """
+    estimator = MotionEstimator(config.motion, seed=config.runtime.seed)
+    iterator = iter(frames)
+
+    def prepare() -> tuple[FrameObs, MotionFrame] | None:
+        frame = next(iterator, None)
+        if frame is None:
+            return None
+        mf = make_motion_frame(frame, config)
+        estimator.features(mf)
+        mf.gradient()
+        return frame, mf
+
+    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="prefetch") as pool:
+        pending: deque[Future[tuple[FrameObs, MotionFrame] | None]] = deque(
+            pool.submit(prepare) for _ in range(max(1, depth))
+        )
+        while pending:
+            item = pending.popleft().result()
+            if item is None:
+                break
+            pending.append(pool.submit(prepare))
+            yield item
+
+
 def split_and_register(
     frames: Iterable[FrameObs],
     config: PipelineConfig,
@@ -312,14 +348,13 @@ def split_and_register(
 ) -> SplitResult:
     """Découpe une vidéo en séquences et recale chacune (une seule passe de décodage)."""
     tracker = SequenceTracker(config)
-    for frame in frames:
+    for frame, motion_frame in prefetch_motion_frames(frames, config):
         if cancel is not None:
             cancel.raise_if_cancelled()
-        tracker.push(frame)
+        tracker.push(frame, motion_frame)
     result = tracker.finish()
     logger.info(
         "%d séquence(s), %d transition(s) sur %d frames",
         len(result.sequences), len(result.transitions), result.frames_seen,
     )
     return result
-

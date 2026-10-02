@@ -13,9 +13,17 @@ import pytest
 from panelrecon import cli
 from panelrecon.core.config import PipelineConfig
 from panelrecon.core.evaluation import ReferenceThresholds, pose_errors
-from panelrecon.core.models import CancellationToken, FrameObs, MaskU8, OperationCancelled
+from panelrecon.core.models import (
+    CancellationToken,
+    FrameObs,
+    MaskU8,
+    OperationCancelled,
+    SimilarityTransform,
+)
 from panelrecon.core.registration import (
     ChainRegistrar,
+    PoseEdge,
+    adjust_poses,
     RegistrationResult,
     make_motion_frame,
     register_frames,
@@ -190,3 +198,41 @@ def test_registration_result_statistics() -> None:
     result = RegistrationResult({}, [], [], [], 0, 1.0)
     assert result.mean_inlier_ratio == 0.0 and result.min_inlier_ratio == 0.0
     assert result.rms_reprojection_error == 0.0
+
+
+# ------------------------------------------------------------ ajustement global
+
+
+def test_adjust_poses_removes_chain_drift() -> None:
+    """Chaîne de 20 frames dont chaque mesure consécutive est biaisée de +0,3 px :
+    la dérive atteint ~6 px ; des liens exacts à longue portée la corrigent."""
+    truth = {i: SimilarityTransform.from_translation(-12.0 * i, 0.0) for i in range(20)}
+    sizes = {i: (640, 360) for i in truth}
+    edges, chained = [], {0: truth[0]}
+    for i in range(1, 20):
+        exact = truth[i - 1].inverse() @ truth[i]  # i → i-1
+        biased = SimilarityTransform.from_translation(0.3, 0.0) @ exact
+        edges.append(PoseEdge(i, i - 1, biased, 1.0))
+        chained[i] = chained[i - 1] @ biased
+    for i in range(6, 20, 6):
+        for k in (0, i - 6):
+            edges.append(PoseEdge(i, k, truth[k].inverse() @ truth[i], 1.0))
+    drift = max(abs(chained[i].tx - truth[i].tx) for i in truth)
+    adjusted, (before, after) = adjust_poses(chained, edges, sizes, 0, 1.0, 10.0)
+    error = max(abs(adjusted[i].tx - truth[i].tx) for i in truth)
+    assert drift > 5.0 and error < 0.6 and after < before
+    assert adjusted[0] == truth[0]  # référence fixe
+
+
+def test_global_adjustment_reduces_drift(synthetic: SyntheticCache) -> None:
+    gt = synthetic.get("pan_vertical")
+    adjusted = _register(gt, 0)
+    cfg = PipelineConfig()
+    cfg.registration.global_adjustment = False
+    chained = _register(gt, 0, cfg)
+    assert adjusted.n_links > 0 and chained.n_links == 0
+    assert adjusted.adjustment_rms_px is not None
+    assert adjusted.adjustment_rms_px[1] < adjusted.adjustment_rms_px[0]
+    err_adjusted = pose_errors(adjusted.transforms, gt.transforms(0), gt.screen_size)
+    err_chained = pose_errors(chained.transforms, gt.transforms(0), gt.screen_size)
+    assert err_adjusted.max_corner_px < err_chained.max_corner_px
