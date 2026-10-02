@@ -85,7 +85,8 @@ def test_weighted_median_rejects_minority_outlier() -> None:
 
 
 def _frame(h: int = 60, w: int = 80) -> FrameObs:
-    return FrameObs(0, 0.0, 0, np.zeros((h, w, 3), np.uint8))
+    # Gris moyen : une frame entièrement noire serait (à juste titre) une bande letterbox.
+    return FrameObs(0, 0.0, 0, np.full((h, w, 3), 128, np.uint8))
 
 
 def test_validity_mask() -> None:
