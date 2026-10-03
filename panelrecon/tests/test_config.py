@@ -17,7 +17,7 @@ from panelrecon.core.config import (
 def test_defaults_are_valid() -> None:
     config = PipelineConfig()
     config.validate()
-    assert config.preprocess.motion_long_side == 640
+    assert config.preprocess.motion_long_side == 960
     assert config.video.extensions == (".mp4", ".mkv", ".webm", ".mov")
     assert config.runtime.device == "auto"
 

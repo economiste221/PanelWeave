@@ -15,6 +15,7 @@ CORE_MODULES = (
     "panelrecon.core.motion",
     "panelrecon.core.registration",
     "panelrecon.core.mosaic",
+    "panelrecon.core.quality",
     "panelrecon.core.scene_split",
     "panelrecon.core.segmentation",
     "panelrecon.core.export",

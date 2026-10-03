@@ -93,7 +93,7 @@ class PreprocessConfig:
     """Prétraitement des frames avant estimation du mouvement."""
 
     motion_long_side: int = param(
-        640,
+        960,
         minimum=64,
         maximum=8192,
         help="Côté long (px) de la version réduite utilisée pour l'estimation du mouvement.",
@@ -175,7 +175,11 @@ class MotionConfig:
     )
     ecc_enabled: bool = param(True, help="Raffinement sous-pixel par ECC.")
     ecc_max_iterations: int = param(50, minimum=1, maximum=10000, help="Itérations ECC.")
-    ecc_epsilon: float = param(1e-4, minimum=1e-12, maximum=1e-1, help="Critère d'arrêt ECC.")
+    ecc_epsilon: float = param(
+        1e-2, minimum=1e-12, maximum=1e-1,
+        help="Critère d'arrêt ECC (variation des paramètres) ; 1e-2 suffit (même précision, ~3x plus "
+        "rapide que 1e-4).",
+    )
     ecc_gauss_filter_size: int = param(
         5, minimum=1, maximum=31, help="Taille (impaire) du filtre gaussien de l'ECC."
     )
@@ -503,6 +507,64 @@ class MosaicConfig:
 
 
 @dataclass
+class QualityConfig:
+    """Contrôle qualité automatique de chaque séquence reconstruite."""
+
+    eval_long_side: int = param(
+        640, minimum=64, maximum=8192,
+        help="Côté long (px) des frames lors de la comparaison frame / panel reprojeté (SSIM).",
+    )
+    max_eval_frames: int = param(
+        60, minimum=1, maximum=100000,
+        help="Frames comparées au panel par séquence (bien réparties, plus toutes les frames "
+        "fusionnées).",
+    )
+    min_eval_overlap: float = param(
+        0.05, minimum=0.0, maximum=1.0,
+        help="Part minimale de la frame recouverte par le panel pour que la comparaison compte.",
+    )
+    eval_erode_px: int = param(
+        3, minimum=0, maximum=100, help="Érosion (px d'évaluation) de la zone comparée."
+    )
+    bad_frame_ssim: float = param(
+        0.85, minimum=-1.0, maximum=1.0,
+        help="SSIM en dessous duquel une frame est jugée mal reprojetée (recalage faux, flou "
+        "de mouvement) ; elle est écartée de la fusion si exclude_bad_frames.",
+    )
+    exclude_bad_frames: bool = param(
+        True, help="Refusionner la séquence sans les frames mal reprojetées (si cela améliore "
+        "l'accord frame / panel)."
+    )
+    ok_min_mean_ssim: float = param(
+        0.92, minimum=-1.0, maximum=1.0, help="SSIM moyen minimal pour le verdict OK."
+    )
+    fail_min_mean_ssim: float = param(
+        0.75, minimum=-1.0, maximum=1.0, help="En dessous de ce SSIM moyen : ÉCHEC."
+    )
+    ok_min_frame_ssim: float = param(
+        0.8, minimum=-1.0, maximum=1.0,
+        help="SSIM minimal d'une frame gardée pour le verdict OK (sinon À VÉRIFIER).",
+    )
+    ok_min_coverage_ratio: float = param(
+        0.9, minimum=0.0, maximum=1.0,
+        help="Part minimale du rectangle recadré réellement observée pour le verdict OK.",
+    )
+    fail_min_coverage_ratio: float = param(
+        0.5, minimum=0.0, maximum=1.0, help="En dessous de cette couverture : ÉCHEC."
+    )
+    ok_max_rms_px: float = param(
+        1.5, minimum=0.0, maximum=1000.0,
+        help="Erreur de reprojection RMS maximale (px réduits) pour le verdict OK.",
+    )
+    ok_min_sharpness: float = param(
+        5.0, minimum=0.0, maximum=1e9,
+        help="Netteté minimale (variance du Laplacien du panel) pour le verdict OK.",
+    )
+    review_dir: str = param("a_verifier", help="Sous-dossier des séquences À VÉRIFIER.")
+    failed_dir: str = param("echec", help="Sous-dossier des séquences en ÉCHEC.")
+
+
+@dataclass
 class ExportConfig:
     """Fichiers produits."""
 
@@ -559,6 +621,7 @@ class PipelineConfig:
     scenes: SceneConfig = field(default_factory=SceneConfig)
     segmentation: SegmentationConfig = field(default_factory=SegmentationConfig)
     mosaic: MosaicConfig = field(default_factory=MosaicConfig)
+    quality: QualityConfig = field(default_factory=QualityConfig)
     export: ExportConfig = field(default_factory=ExportConfig)
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
     schema_version: int = CONFIG_SCHEMA_VERSION

@@ -485,6 +485,10 @@ class QualityReport:
     sharpness: float
     verdict: Verdict
     reasons: tuple[str, ...] = field(default_factory=tuple)
+    min_ssim: float | None = None  # pire frame gardée
+    frames_evaluated: int = 0
+    excluded_frames: tuple[int, ...] = ()  # écartées par le contrôle qualité
+    frame_ssim: tuple[tuple[int, float], ...] = ()  # (frame, SSIM) de chaque frame évaluée
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -498,6 +502,10 @@ class QualityReport:
             "sharpness": self.sharpness,
             "verdict": self.verdict.value,
             "reasons": list(self.reasons),
+            "min_ssim": self.min_ssim,
+            "frames_evaluated": self.frames_evaluated,
+            "excluded_frames": list(self.excluded_frames),
+            "frame_ssim": {str(i): round(v, 4) for i, v in self.frame_ssim},
         }
 
 

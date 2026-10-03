@@ -33,7 +33,7 @@ import time
 import traceback
 from collections.abc import Callable, Iterable, Iterator
 from concurrent.futures import Future
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -50,14 +50,20 @@ from panelrecon.core.hardware import resolve_num_workers
 from panelrecon.core.models import (
     CancellationToken,
     FrameObs,
+    ImageU8,
+    MosaicResult,
     OperationCancelled,
+    QualityReport,
     Sequence,
+    SimilarityTransform,
+    Verdict,
     VideoInfo,
 )
 from panelrecon.core.mosaic import build_mosaic, plan_fusion
 from panelrecon.core.motion import MotionEstimator, to_native
 from panelrecon.core.parallel import WorkerPool, collect, worker_cancel_token
-from panelrecon.core.registration import make_motion_frame
+from panelrecon.core.quality import assess, evaluation_sample, frame_agreement
+from panelrecon.core.registration import RegistrationResult, make_motion_frame
 from panelrecon.core.scene_split import (
     SequenceRegistration,
     SplitResult,
@@ -86,12 +92,19 @@ class SequenceOutcome:
     files: ExportedFiles | None = None
     error: str | None = None
     warnings: list[str] = field(default_factory=list)
+    quality: QualityReport | None = None
+
+    @property
+    def verdict(self) -> Verdict | None:
+        return None if self.quality is None else self.quality.verdict
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "number": self.number,
             "sequence": self.sequence.to_dict(),
             "frames_used": self.frames_used,
+            "verdict": None if self.quality is None else self.quality.verdict.value,
+            "quality_reasons": [] if self.quality is None else list(self.quality.reasons),
             "files": None if self.files is None else self.files.to_dict(),
             "error": self.error,
             "warnings": self.warnings,
@@ -291,8 +304,93 @@ def _finish_region(k: int, estimator: PanelRegionEstimator | None) -> PanelRegio
     return region
 
 
+FramesFor = Callable[[set[int]], Iterable[FrameObs]]
+"""Frames natives (avec image réduite) d'une séquence, restreintes aux indices donnés."""
+
+
+def _canvas_offset(to_canvas: dict[int, SimilarityTransform],
+                   transforms: dict[int, SimilarityTransform]) -> SimilarityTransform:
+    """Passage repère canonique → canevas (identique pour toutes les frames)."""
+    i = next(iter(to_canvas))
+    return to_canvas[i] @ transforms[i].inverse()
+
+
+def _agreements(grays: dict[int, tuple[ImageU8, float]], offset: SimilarityTransform,
+                transforms: dict[int, SimilarityTransform], mosaic: MosaicResult,
+                config: PipelineConfig) -> dict[int, float | None]:
+    return {i: frame_agreement(gray, factor, offset @ transforms[i], mosaic, config.quality)
+            for i, (gray, factor) in sorted(grays.items())}
+
+
+def _mean_over(values: dict[int, float | None], keys: Iterable[int]) -> float | None:
+    kept = [v for i in keys if (v := values.get(i)) is not None]
+    return float(np.mean(kept)) if kept else None
+
+
+def _build_and_assess(
+    frames_for: FramesFor,
+    item: SequenceRegistration,
+    region: PanelRegion | None,
+    config: PipelineConfig,
+    cancel: CancellationToken | None,
+    progress: ProgressCallback,
+    allow_refusion: bool,
+) -> tuple[MosaicResult, RegistrationResult, QualityReport]:
+    """Fusion, contrôle qualité et, si besoin, refusion sans les frames mal reprojetées."""
+    qcfg = config.quality
+    registration = item.registration
+    clip = None if region is None else region.bounds()
+    masks = None if region is None else region.mask
+    eval_set = set(evaluation_sample(registration.transforms, qcfg.max_eval_frames))
+    grays: dict[int, tuple[ImageU8, float]] = {}
+
+    def fuse(reg: RegistrationResult, report: ProgressCallback) -> MosaicResult:
+        chosen = set(plan_fusion(reg, config, clip)[2])
+        eval_set.update(chosen)
+
+        def tap(frames: Iterable[FrameObs]) -> Iterator[FrameObs]:
+            for frame in frames:
+                if frame.index in eval_set and frame.proxy_gray is not None:
+                    grays.setdefault(frame.index, (frame.proxy_gray, frame.proxy_factor))
+                yield frame
+
+        wanted = chosen | (eval_set - grays.keys())
+        return build_mosaic(tap(frames_for(wanted)), reg, config, panel_masks=masks,
+                            cancel=cancel, progress=report, clip=clip)
+
+    mosaic = fuse(registration, _scaled(progress, 0.0, 0.8 if allow_refusion else 1.0))
+    offset = _canvas_offset(mosaic.transforms, registration.transforms)
+    agreements = _agreements(grays, offset, registration.transforms, mosaic, config)
+    excluded: set[int] = set()
+    bad = {i for i, v in agreements.items() if v is not None and v < qcfg.bad_frame_ssim}
+    if allow_refusion and qcfg.exclude_bad_frames and bad and len(bad) < len(registration.transforms):
+        reduced = replace(
+            registration,
+            transforms={i: t for i, t in registration.transforms.items() if i not in bad},
+            excluded=sorted(set(registration.excluded) | bad),
+        )
+        retry = fuse(reduced, _scaled(progress, 0.8, 0.2))
+        offset2 = _canvas_offset(retry.transforms, reduced.transforms)
+        agreements2 = _agreements(grays, offset2, registration.transforms, retry, config)
+        common = [i for i in agreements if i not in bad]
+        before, after = _mean_over(agreements, common), _mean_over(agreements2, common)
+        if after is not None and (before is None or after >= before):
+            logger.info("Séquence %d–%d : %d frame(s) mal reprojetée(s) écartée(s) %s, "
+                        "SSIM moyen %.3f → %.3f", item.sequence.start_idx, item.sequence.end_idx,
+                        len(bad), sorted(bad), before or 0.0, after)
+            mosaic, registration, agreements, excluded = retry, reduced, agreements2, bad
+    quality = assess(mosaic, registration, agreements, config, excluded)
+    return mosaic, registration, quality
+
+
+def _verdict_dir(out_dir: Path, verdict: Verdict, config: PipelineConfig) -> Path:
+    name = {Verdict.OK: "", Verdict.TO_REVIEW: config.quality.review_dir,
+            Verdict.FAILED: config.quality.failed_dir}[verdict]
+    return out_dir / Path(name).name if name else out_dir
+
+
 def _fuse_and_export(
-    frames: Iterable[FrameObs],
+    frames_for: FramesFor,
     k: int,
     item: SequenceRegistration,
     region: PanelRegion | None,
@@ -302,23 +400,29 @@ def _fuse_and_export(
     info: VideoInfo | None,
     cancel: CancellationToken | None,
     progress: ProgressCallback | None,
+    allow_refusion: bool = True,
 ) -> SequenceOutcome:
-    """Fusion et export d'une séquence ; une erreur est capturée dans le résultat."""
-    sequence, registration = item.sequence, item.registration
-    outcome = SequenceOutcome(k, sequence, len(registration.transforms))
+    """Fusion, contrôle qualité et export d'une séquence ; une erreur est capturée.
+
+    Les séquences non OK sont exportées dans un sous-dossier propre à leur verdict.
+    """
+    sequence = item.sequence
+    outcome = SequenceOutcome(k, sequence, len(item.registration.transforms))
     try:
-        mosaic = build_mosaic(
-            frames, registration, config,
-            panel_masks=None if region is None else region.mask,
-            cancel=cancel,
-            progress=progress,
-            clip=None if region is None else region.bounds(),
-        )
-        extra = {"segmentation": None if region is None else {
-            "segmented": region.segmented,
-            "panel_polygon_canonical": region.polygon.tolist(),
-        }}
-        outcome.files = export_sequence(mosaic, registration, out_dir,
+        mosaic, registration, quality = _build_and_assess(
+            frames_for, item, region, config, cancel, _scaled(progress, 0.0, 1.0),
+            allow_refusion)
+        extra: dict[str, Any] = {
+            "segmentation": None if region is None else {
+                "segmented": region.segmented,
+                "panel_polygon_canonical": region.polygon.tolist(),
+            },
+            "quality": quality.to_dict(),
+        }
+        outcome.quality = quality
+        outcome.frames_used = len(registration.transforms)
+        outcome.files = export_sequence(mosaic, registration,
+                                        _verdict_dir(out_dir, quality.verdict, config),
                                         sequence_basename(video_stem, k, sequence),
                                         config, info, extra)
         if region is not None and not region.segmented:
@@ -341,7 +445,7 @@ def _reconstruct_sequence(
     cancel: CancellationToken | None = None,
     progress: ProgressCallback | None = None,
 ) -> SequenceOutcome:
-    """Tâche : segmentation, fusion et export d'une séquence (accès direct aux frames)."""
+    """Tâche : segmentation, fusion, contrôle qualité et export d'une séquence."""
     cancel = worker_cancel_token(cancel)
     config = source.config
     start, stop = item.sequence.start_idx, item.sequence.end_idx + 1
@@ -358,15 +462,15 @@ def _reconstruct_sequence(
                     estimator.add(frame)
                 region = _finish_region(k, estimator)
             report(0.1, f"séquence {k} : fusion")
-            chosen = plan_fusion(item.registration, config,
-                                 None if region is None else region.bounds())[2]
-            frames = reader.frames(start, stop, compute_proxy=False, wanted=set(chosen))
-            return _fuse_and_export(frames, k, item, region, config, out_dir,
-                                    source.path.stem, info, cancel,
-                                    _scaled(progress, 0.1, 0.9))
+
+            def frames_for(wanted: set[int]) -> Iterable[FrameObs]:
+                return reader.frames(start, stop, wanted=wanted)
+
+            return _fuse_and_export(frames_for, k, item, region, config, out_dir,
+                                    source.path.stem, info, cancel, _scaled(progress, 0.1, 0.9))
     except OperationCancelled:
         raise
-    except Exception as exc:  # planification ou lecture impossible : séquence en échec
+    except Exception as exc:  # lecture impossible : séquence en échec
         outcome = SequenceOutcome(k, item.sequence, len(item.registration.transforms))
         outcome.error = f"{type(exc).__name__}: {exc}"
         logger.error("Séquence %d de %s en échec : %s\n%s", k, source.path.name, outcome.error,
@@ -412,26 +516,36 @@ def _reconstruct_streaming(source: _VideoSource, split: SplitResult, out_dir: Pa
     with source.reader(cancel) as reader:
         regions = _segment_streaming(reader, split, config, cancel,
                                      _scaled(progress, 0.0, 0.25), total)
-        # Seules les frames retenues pour la fusion sont converties (résolution native).
+        # Seules les frames retenues pour la fusion et pour le contrôle qualité sont
+        # converties (résolution native).
         needed: set[int] = set()
         for k, item in enumerate(split.sequences):
             region = regions.get(k)
+            needed.update(evaluation_sample(item.registration.transforms,
+                                            config.quality.max_eval_frames))
             try:
                 needed.update(plan_fusion(item.registration, config,
                                           None if region is None else region.bounds())[2])
             except (ValueError, MemoryError) as exc:
                 logger.warning("Séquence %d : planification de la fusion impossible (%s)", k, exc)
-        stream = _SharedStream(reader.frames(compute_proxy=False, wanted=needed))
+        stream = _SharedStream(reader.frames(wanted=needed))
         outcomes = []
         n = len(split.sequences)
         for k, item in enumerate(split.sequences):
             if cancel is not None:
                 cancel.raise_if_cancelled()
-            frames = stream.take(item.sequence.start_idx, item.sequence.end_idx)
-            outcomes.append(_fuse_and_export(frames, k, item, regions.get(k), config, out_dir,
-                                             source.path.stem, info, cancel,
-                                             _scaled(progress, 0.25 + 0.75 * k / n, 0.75 / n)))
-            for _ in frames:  # consomme le reste de la séquence (cas d'échec)
+            first, last = item.sequence.start_idx, item.sequence.end_idx
+
+            def frames_for(wanted: set[int], first: int = first,
+                           last: int = last) -> Iterable[FrameObs]:
+                return stream.take(first, last)
+
+            # Flux à lecture unique : pas de refusion sans les frames mal reprojetées.
+            outcomes.append(_fuse_and_export(frames_for, k, item, regions.get(k), config,
+                                             out_dir, source.path.stem, info, cancel,
+                                             _scaled(progress, 0.25 + 0.75 * k / n, 0.75 / n),
+                                             allow_refusion=False))
+            for _ in stream.take(first, last):  # consomme le reste de la séquence (cas d'échec)
                 pass
     return outcomes
 

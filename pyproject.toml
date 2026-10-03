@@ -25,6 +25,9 @@ dev = ["pytest>=8", "pytest-qt>=4.4", "mypy>=1.10"]
 [project.scripts]
 panelrecon = "panelrecon.cli:main"
 
+[project.gui-scripts]
+panelrecon-gui = "panelrecon.gui.app:main"
+
 [tool.setuptools.packages.find]
 include = ["panelrecon*"]
 
@@ -40,5 +43,5 @@ warn_unreachable = true
 files = ["panelrecon"]
 
 [[tool.mypy.overrides]]
-module = ["scenedetect.*", "skimage.*", "scipy.*"]
+module = ["scenedetect.*", "skimage.*", "scipy.*", "PyInstaller.*"]
 ignore_missing_imports = true

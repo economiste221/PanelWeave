@@ -303,7 +303,7 @@ ses choix et un texte d'aide (réutilisés par l'interface en phase 8). Sections
 
 * `video` : extensions, récursivité, repli OpenCV, `frame_step`, `max_fps` (sur timestamps),
   threads de décodage, rotation d'affichage, tolérance aux paquets corrompus ;
-* `preprocess` : côté long de la version réduite pour le mouvement (640 px), zones d'exclusion
+* `preprocess` : côté long de la version réduite pour le mouvement (960 px), zones d'exclusion
   relatives (sous-titres, logos) ;
 * `motion` : détecteur, nombre de points, étirement de contraste et détection « peu texturée »,
   ratio de Lowe, paramètres RANSAC, inliers et taux minimaux, érosion du masque, régularisation et

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -11,6 +12,9 @@ from panelrecon.core.registration import PanelMaskProvider, RegistrationResult, 
 from panelrecon.core.synthetic import GroundTruth, generate_video, scenario
 from panelrecon.core.video_io import VideoReader
 from panelrecon.tests.videofactory import index_frame, write_video
+
+# Tests de l'interface sans écran (doit précéder la création de la QApplication).
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 N_FRAMES = 24
 FPS = 25

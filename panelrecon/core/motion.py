@@ -541,22 +541,49 @@ def photometric_consistency(
         return -1.0, ratio
     # Seuil de texture : 99e percentile estimé sur un pixel sur 16 (suffisant, bien moins cher).
     texture = 0.05 * float(np.percentile(grad_dst[overlap_b][::16], 99))
-    h, w = overlap_b.shape
-    scores: list[float] = []
-    for y0 in range(0, h, tile_px):
-        for x0 in range(0, w, tile_px):
-            sl = (slice(y0, min(h, y0 + tile_px)), slice(x0, min(w, x0 + tile_px)))
-            m = overlap_b[sl]
-            if m.mean() < 0.5:
-                continue
-            x = warped[sl][m]
-            y = grad_dst[sl][m]
-            if max(float(x.mean()), float(y.mean())) < texture:
-                continue
-            value = _ncc(x, y)
-            if value is not None:
-                scores.append(value)
-    if not scores:
+    scores = _tile_ncc(np.asarray(warped, dtype=np.float32), grad_dst, overlap_b, tile_px,
+                       texture)
+    if scores.size == 0:
         global_value = _ncc(warped[overlap_b], grad_dst[overlap_b])
         return (-1.0 if global_value is None else global_value), ratio
     return float(np.median(scores)), ratio
+
+
+def _tile_sums(values: NDArray[np.float64], tile_px: int, rows: int,
+               cols: int) -> NDArray[np.float64]:
+    """Sommes par tuile ``tile_px × tile_px`` (tuiles de bord incomplètes comprises)."""
+    h, w = values.shape
+    padded = np.zeros((rows * tile_px, cols * tile_px), dtype=np.float64)
+    padded[:h, :w] = values
+    return np.asarray(padded.reshape(rows, tile_px, cols, tile_px).sum(axis=(1, 3)),
+                      dtype=np.float64)
+
+
+def _tile_ncc(x: NDArray[np.float32], y: NDArray[np.float32], mask: NDArray[np.bool_],
+              tile_px: int, texture: float) -> NDArray[np.float64]:
+    """NCC par tuile sur les pixels de ``mask`` (calcul vectorisé).
+
+    Une tuile compte si au moins la moitié de ses pixels (tuile de bord : de sa
+    partie dans l'image) est dans le masque, si l'une des deux moyennes atteint
+    ``texture`` et si les deux signaux varient.
+    """
+    h, w = mask.shape
+    rows, cols = -(-h // tile_px), -(-w // tile_px)
+    m = mask.astype(np.float64)
+    xm = np.where(mask, x, 0.0).astype(np.float64)
+    ym = np.where(mask, y, 0.0).astype(np.float64)
+    area = _tile_sums(np.ones((h, w), np.float64), tile_px, rows, cols)
+    n = _tile_sums(m, tile_px, rows, cols)
+    sx, sy = _tile_sums(xm, tile_px, rows, cols), _tile_sums(ym, tile_px, rows, cols)
+    sxx, syy = _tile_sums(xm * xm, tile_px, rows, cols), _tile_sums(ym * ym, tile_px, rows, cols)
+    sxy = _tile_sums(xm * ym, tile_px, rows, cols)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        safe_n = np.maximum(n, 1.0)
+        vx = sxx - sx * sx / safe_n
+        vy = syy - sy * sy / safe_n
+        cov = sxy - sx * sy / safe_n
+        denom = np.sqrt(np.maximum(vx, 0.0) * np.maximum(vy, 0.0))
+        ncc = cov / denom
+        keep = ((n >= 0.5 * area) & (np.maximum(sx, sy) / safe_n >= texture) & (n > 0)
+                & (denom > 1e-9))
+    return np.asarray(ncc[keep], dtype=np.float64)
