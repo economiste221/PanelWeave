@@ -20,8 +20,8 @@ vidéo → séquences → segmentation panel/fond → mouvement inter-frames →
 | 4 | Mosaïque, fusion médiane pondérée par tuiles, couverture, recadrage, export, pipeline | ✅ |
 | 5 | Découpage en séquences (coupes, fondus), segmentation panel/fond | ✅ |
 | 6 | Ajustement global des poses (images clés, liens à longue portée) | ✅ |
-| 7 | Contrôle qualité, rapport | à faire |
-| 8 | Interface PyQt5 | à faire |
+| 7 | Contrôle qualité (SSIM frame/panel, couverture, netteté, verdicts), refusion | ✅ |
+| 8 | Interface PyQt5, application macOS (.app / .dmg) | ✅ |
 | 9 | Traitement multiprocessus (tronçons, séquences, lots) | ✅ |
 | 9 | Modules optionnels (LoFTR, RAFT, SAM 2) | à faire |
 
@@ -87,6 +87,52 @@ décodage, intervalles min/médian/max, détection de fréquence variable) et `p
 Une vidéo illisible est journalisée avec sa trace sans interrompre le lot.
 Codes de sortie : `0` succès, `1` au moins une vidéo en échec, `2` erreur d'usage/configuration,
 `130` interruption.
+
+## Application (interface graphique)
+
+```bash
+python -m panelrecon.gui            # ou : panelrecon-gui (après pip install -e .)
+```
+
+Glissez-déposez des vidéos ou des dossiers dans la fenêtre, puis **Lancer**. Pour chaque vidéo :
+progression, nombre de panels et verdicts. En sélectionnant une vidéo, les panels reconstruits
+s'affichent (vignettes colorées selon le verdict, visionneuse avec zoom à la molette et
+déplacement, carte de couverture, aperçu de n'importe quelle frame de la vidéo). Tous les
+paramètres sont modifiables dans le panneau **Paramètres** (bornes vérifiées, profils JSON,
+mémorisés entre deux sessions). Le calcul s'exécute hors du thread de l'interface (pool de
+processus) ; **Annuler** l'interrompt proprement.
+
+### Construire l'application Mac
+
+Sur un Mac Apple Silicon (Python 3.11/3.12 arm64 natif) :
+
+```bash
+./packaging/macos/build_app.sh
+```
+
+Le script crée un environnement isolé, installe les dépendances, construit
+`dist/PanelRecon.app` (PyInstaller, arm64), la signe en ad hoc, vérifie qu'elle traite une vidéo
+de test, puis produit `dist/PanelRecon.dmg`. Au premier lancement, macOS peut demander de
+l'ouvrir via clic droit → **Ouvrir** (application non notariée). L'exécutable accepte aussi
+`--cli` pour un traitement par lot sans interface :
+`PanelRecon.app/Contents/MacOS/PanelRecon --cli -i dossier -o sortie`.
+
+## Contrôle qualité (phase 7)
+
+Pour chaque panel, le résultat est reprojeté dans les frames de la séquence et comparé à
+chacune (SSIM sur la zone couverte, à 640 px). Une frame mal recalée ou floue (flou de
+mouvement) obtient un SSIM faible : elle est écartée et le panel est refusionné sans elle si
+l'accord s'améliore. Le rapport JSON de chaque panel contient le SSIM moyen et minimal, le
+SSIM de chaque frame évaluée, la couverture du rectangle recadré, la netteté (variance du
+Laplacien), les taux d'inliers et l'erreur de reprojection, et un **verdict** :
+
+* **OK** : tous les seuils `quality.*` sont respectés ;
+* **À VÉRIFIER** (sous-dossier `a_verifier/`) : SSIM moyen < 0,92, frame gardée < 0,80,
+  couverture < 90 %, erreur de reprojection élevée, panel peu net ou recalage interrompu ;
+* **ÉCHEC** (sous-dossier `echec/`) : SSIM moyen < 0,75, couverture < 50 % ou aucune frame
+  comparable.
+
+Les raisons sont listées dans le rapport et dans l'interface.
 
 ## Parallélisme
 
@@ -320,6 +366,8 @@ ses choix et un texte d'aide (réutilisés par l'interface en phase 8). Sections
 * `mosaic` : interpolation, taille maximale du canevas, bande de bord d'écran, érosion du masque,
   rampe et poids minimal de bord, puissance du poids d'échelle, taille des tuiles, couverture
   minimale, mode de recadrage, seuil de pile sur disque et dossier temporaire ;
+* `quality` : résolution et nombre de frames de l'évaluation, seuil de frame mal reprojetée et
+  refusion, seuils des verdicts, sous-dossiers des panels non OK ;
 * `export` : carte de couverture, transformations dans le rapport, compression PNG ;
 * `runtime` : graine, device (`auto` = CUDA → MPS → CPU), nombre de processus
   (`0` = cœurs performance via `sysctl hw.perflevel0.physicalcpu`), durée maximale et minimale
